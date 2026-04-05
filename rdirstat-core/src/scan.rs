@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::{fs, thread};
 
 use ignore::WalkBuilder;
 
@@ -58,6 +58,9 @@ pub struct ScanState {
     pub deepest_path: Mutex<(PathBuf, usize)>,
     /// When the current scan started.
     pub scan_start: Mutex<Option<std::time::Instant>>,
+    /// Per-directory completion: entries yielded by walker, entries expected.
+    /// (yielded_count, expected_count or 0 if unknown)
+    dir_completion: Mutex<HashMap<PathBuf, (usize, usize)>>,
 }
 
 const TOP_N: usize = 10;
@@ -82,6 +85,7 @@ impl ScanState {
             deepest_depth: AtomicUsize::new(0),
             deepest_path: Mutex::new((PathBuf::new(), 0)),
             scan_start: Mutex::new(None),
+            dir_completion: Mutex::new(HashMap::with_capacity(100_000)),
         })
     }
 
@@ -123,7 +127,6 @@ impl ScanState {
 
     pub fn record_dir(&self, depth: usize) {
         self.dirs_scanned.fetch_add(1, Ordering::Relaxed);
-        // Only update deepest_depth atomically; path is set below if needed
         loop {
             let current = self.deepest_depth.load(Ordering::Relaxed);
             if depth <= current {
@@ -137,8 +140,6 @@ impl ScanState {
         }
     }
 
-    /// Set the deepest path. Called separately from record_dir to avoid
-    /// passing the path when depth isn't a record.
     pub fn set_deepest_path(&self, path: &Path, depth: usize) {
         let mut deepest = self.deepest_path.lock().unwrap();
         if depth > deepest.1 {
@@ -153,17 +154,20 @@ impl ScanState {
             return;
         }
         let mut top = self.top_dirs.lock().unwrap();
-        if top.len() < TOP_N || size > top.last().map(|e| e.size).unwrap_or(0) {
+        // Update existing entry if path already tracked, otherwise insert
+        if let Some(existing) = top.iter_mut().find(|e| e.path == path) {
+            existing.size = size;
+        } else if top.len() < TOP_N || size > top.last().map(|e| e.size).unwrap_or(0) {
             top.push(SizedEntry { path: path.to_path_buf(), size });
-            top.sort_by(|a, b| b.size.cmp(&a.size));
-            top.truncate(TOP_N);
-            let new_min = if top.len() >= TOP_N {
-                top.last().map(|e| e.size).unwrap_or(0)
-            } else {
-                0
-            };
-            self.top_dirs_min.store(new_min, Ordering::Relaxed);
         }
+        top.sort_by(|a, b| b.size.cmp(&a.size));
+        top.truncate(TOP_N);
+        let new_min = if top.len() >= TOP_N {
+            top.last().map(|e| e.size).unwrap_or(0)
+        } else {
+            0
+        };
+        self.top_dirs_min.store(new_min, Ordering::Relaxed);
     }
 
     /// Merge thread-local extension stats into the shared map.
@@ -207,6 +211,53 @@ impl ScanState {
         self.deepest_depth.store(0, Ordering::Relaxed);
         *self.deepest_path.lock().unwrap() = (PathBuf::new(), 0);
         *self.scan_start.lock().unwrap() = None;
+        self.dir_completion.lock().unwrap().clear();
+    }
+
+    /// Apply batched "entry yielded" counts and check for completions.
+    /// A directory completes when yielded == expected and all child dirs are complete.
+    fn process_completions(
+        &self,
+        yielded: &mut HashMap<PathBuf, usize>,
+        root: &Path,
+    ) -> Vec<PathBuf> {
+        if yielded.is_empty() {
+            return Vec::new();
+        }
+
+        let mut newly_completed = Vec::new();
+        let mut completion = self.dir_completion.lock().unwrap();
+        let mut to_check: Vec<PathBuf> = Vec::new();
+
+        // Apply yielded counts
+        for (parent, count) in yielded.drain() {
+            let entry = completion.entry(parent.clone()).or_insert((0, 0));
+            entry.0 += count;
+            to_check.push(parent);
+        }
+
+        // Check completions and cascade
+        while let Some(path) = to_check.pop() {
+            if let Some(&(yielded, expected)) = completion.get(&path) {
+                if expected > 0 && yielded >= expected {
+                    completion.remove(&path);
+                    newly_completed.push(path.clone());
+
+                    // Cascade to parent
+                    if path != root {
+                        if let Some(parent) = path.parent() {
+                            let parent_entry = completion
+                                .entry(parent.to_path_buf())
+                                .or_insert((0, 0));
+                            parent_entry.0 += 1;
+                            to_check.push(parent.to_path_buf());
+                        }
+                    }
+                }
+            }
+        }
+
+        newly_completed
     }
 }
 
@@ -217,6 +268,10 @@ struct ThreadLocalState {
     root: PathBuf,
     local_dir_sizes: HashMap<PathBuf, u64>,
     local_ext_stats: HashMap<String, (u64, u64)>,
+    /// Entries yielded per parent directory (for completion tracking).
+    local_yielded: HashMap<PathBuf, usize>,
+    /// Directories to register with their expected child counts (depth <= 1 only).
+    pending_expected: Vec<(PathBuf, usize)>,
     local_count: u64,
     local_deepest: (PathBuf, usize),
     errors: u64,
@@ -229,6 +284,8 @@ impl ThreadLocalState {
             root,
             local_dir_sizes: HashMap::new(),
             local_ext_stats: HashMap::new(),
+            local_yielded: HashMap::new(),
+            pending_expected: Vec::new(),
             local_count: 0,
             local_deepest: (PathBuf::new(), 0),
             errors: 0,
@@ -245,16 +302,82 @@ impl ThreadLocalState {
         }
     }
 
+    fn flush_completions(&mut self) {
+        // Register any pending expected counts
+        if !self.pending_expected.is_empty() {
+            let mut completion = self.state.dir_completion.lock().unwrap();
+            for (path, expected) in self.pending_expected.drain(..) {
+                let entry = completion.entry(path).or_insert((0, 0));
+                entry.1 = expected;
+            }
+        }
+
+        let newly_completed = self.state.process_completions(
+            &mut self.local_yielded,
+            &self.root,
+        );
+
+        if newly_completed.is_empty() {
+            return;
+        }
+
+        // Get sizes and mark completed
+        let completed_with_sizes: Vec<(PathBuf, u64)> = {
+            let sizes = self.state.dir_sizes.lock().unwrap();
+            newly_completed
+                .iter()
+                .map(|p| (p.clone(), sizes.get(p).copied().unwrap_or(0)))
+                .collect()
+        };
+
+        {
+            let mut comp = self.state.completed.lock().unwrap();
+            for (path, _) in &completed_with_sizes {
+                comp.insert(path.clone());
+            }
+        }
+
+        for (path, size) in &completed_with_sizes {
+            self.state.record_completed_dir(path, *size);
+        }
+    }
+
+    fn flush(&mut self) {
+        self.flush_dir_sizes();
+        self.flush_completions();
+    }
+
     fn process_entry(&mut self, entry: ignore::DirEntry) {
         let depth = entry.depth();
         let path = strip_unc_prefix(entry.path().to_path_buf());
+        let ft = entry.file_type();
+        let is_dir = ft.map_or(false, |ft| ft.is_dir());
+        let is_file = ft.map_or(false, |ft| ft.is_file());
 
-        if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+        // Every entry (file, dir, symlink) counts as yielded in its parent
+        if depth > 0 {
+            if let Some(parent) = path.parent() {
+                *self.local_yielded
+                    .entry(parent.to_path_buf())
+                    .or_insert(0) += 1;
+            }
+        }
+
+        if is_dir {
             self.state.record_dir(depth);
             if depth > self.local_deepest.1 {
-                self.local_deepest = (path, depth);
+                self.local_deepest = (path.clone(), depth);
             }
-        } else if entry.file_type().map_or(false, |ft| ft.is_file()) {
+
+            // For shallow dirs, count children cheaply (few dirs at depth 0-1).
+            // For deeper dirs, expected count comes from the walker yielding entries.
+            if depth <= 1 {
+                let expected = fs::read_dir(&path)
+                    .map(|rd| rd.count())
+                    .unwrap_or(0);
+                self.pending_expected.push((path, expected));
+            }
+        } else if is_file {
             let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
 
             self.state.total_bytes.fetch_add(len, Ordering::Relaxed);
@@ -281,8 +404,10 @@ impl ThreadLocalState {
             self.local_count += 1;
 
             if self.local_count % FLUSH_INTERVAL == 0 {
-                self.flush_dir_sizes();
-                self.state.files_scanned.fetch_add(FLUSH_INTERVAL, Ordering::Relaxed);
+                self.flush();
+                self.state
+                    .files_scanned
+                    .fetch_add(FLUSH_INTERVAL, Ordering::Relaxed);
                 self.state.merge_ext_stats(&self.local_ext_stats);
                 self.local_ext_stats.clear();
                 self.state.refresh_top_exts(15);
@@ -293,23 +418,25 @@ impl ThreadLocalState {
 
 impl Drop for ThreadLocalState {
     fn drop(&mut self) {
-        // Flush remaining dir sizes
-        self.flush_dir_sizes();
-        // Flush remaining file count
+        self.flush();
         let remainder = self.local_count % FLUSH_INTERVAL;
         if remainder > 0 {
-            self.state.files_scanned.fetch_add(remainder, Ordering::Relaxed);
+            self.state
+                .files_scanned
+                .fetch_add(remainder, Ordering::Relaxed);
         }
-        // Merge remaining ext stats
         if !self.local_ext_stats.is_empty() {
             self.state.merge_ext_stats(&self.local_ext_stats);
         }
-        // Update deepest path if this thread found a deeper one
         if self.local_deepest.1 > 0 {
-            self.state.set_deepest_path(&self.local_deepest.0, self.local_deepest.1);
+            self.state
+                .set_deepest_path(&self.local_deepest.0, self.local_deepest.1);
         }
         if self.errors > 0 {
-            log(&format!("scan: thread finished with {} errors", self.errors));
+            log(&format!(
+                "scan: thread finished with {} errors",
+                self.errors
+            ));
         }
     }
 }
@@ -358,18 +485,18 @@ pub fn start_scan(root: PathBuf, state: Arc<ScanState>) {
             })
         });
 
-        // After walk completes: mark all directories as completed, find top dirs
-        let entries: Vec<(PathBuf, u64)> = {
+        // Mark all remaining directories as completed
+        let all_dirs: Vec<(PathBuf, u64)> = {
             let sizes = state.dir_sizes.lock().unwrap();
             sizes.iter().map(|(p, &s)| (p.clone(), s)).collect()
         };
         {
             let mut comp = state.completed.lock().unwrap();
-            for (dir, _) in &entries {
+            for (dir, _) in &all_dirs {
                 comp.insert(dir.clone());
             }
         }
-        for (dir, size) in &entries {
+        for (dir, size) in &all_dirs {
             state.record_completed_dir(dir, *size);
         }
 
