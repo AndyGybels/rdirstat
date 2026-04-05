@@ -230,6 +230,220 @@ fn main() {
     println!("  Vec entries: {}", sizes_vec.lock().unwrap().len());
     println!();
 
+    // ── Mode 5: ignore crate parallel walker ───────────────────────────
+    println!("=== Mode 5: ignore::WalkParallel (ripgrep's walker) ===");
+    {
+        let files = Arc::new(AtomicU64::new(0));
+        let dirs = Arc::new(AtomicU64::new(0));
+        let bytes = Arc::new(AtomicU64::new(0));
+
+        let start = Instant::now();
+
+        let walker = ignore::WalkBuilder::new(&root)
+            .hidden(false)
+            .ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .follow_links(false)
+            .threads(num_cpus::get().max(2))
+            .build_parallel();
+
+        let files2 = Arc::clone(&files);
+        let dirs2 = Arc::clone(&dirs);
+        let bytes2 = Arc::clone(&bytes);
+
+        walker.run(|| {
+            let files = Arc::clone(&files2);
+            let dirs = Arc::clone(&dirs2);
+            let bytes = Arc::clone(&bytes2);
+            Box::new(move |entry| {
+                if let Ok(e) = entry {
+                    if let Some(ft) = e.file_type() {
+                        if ft.is_file() {
+                            files.fetch_add(1, Ordering::Relaxed);
+                            let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                            bytes.fetch_add(len, Ordering::Relaxed);
+                        } else if ft.is_dir() {
+                            dirs.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                ignore::WalkState::Continue
+            })
+        });
+
+        let elapsed = start.elapsed();
+        let r = BenchResult {
+            files: files.load(Ordering::Relaxed),
+            dirs: dirs.load(Ordering::Relaxed),
+            bytes: bytes.load(Ordering::Relaxed),
+            elapsed,
+        };
+        print_result(&r);
+    }
+
+    // ── Mode 6: ignore parallel + HashMap (full work) ────────────────────
+    println!("=== Mode 6: ignore::WalkParallel + shared HashMap ===");
+    {
+        let files = Arc::new(AtomicU64::new(0));
+        let dirs = Arc::new(AtomicU64::new(0));
+        let bytes = Arc::new(AtomicU64::new(0));
+        let map: Arc<Mutex<HashMap<PathBuf, u64>>> =
+            Arc::new(Mutex::new(HashMap::with_capacity(100_000)));
+
+        let start = Instant::now();
+
+        let walker = ignore::WalkBuilder::new(&root)
+            .hidden(false)
+            .ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .follow_links(false)
+            .threads(num_cpus::get().max(2))
+            .build_parallel();
+
+        let files2 = Arc::clone(&files);
+        let dirs2 = Arc::clone(&dirs);
+        let bytes2 = Arc::clone(&bytes);
+        let map2 = Arc::clone(&map);
+
+        walker.run(|| {
+            let files = Arc::clone(&files2);
+            let dirs = Arc::clone(&dirs2);
+            let bytes = Arc::clone(&bytes2);
+            let map = Arc::clone(&map2);
+            // Thread-local batch for dir completions
+            let mut local_dirs: Vec<(PathBuf, u64)> = Vec::new();
+            Box::new(move |entry| {
+                if let Ok(e) = entry {
+                    if let Some(ft) = e.file_type() {
+                        if ft.is_file() {
+                            files.fetch_add(1, Ordering::Relaxed);
+                            let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                            bytes.fetch_add(len, Ordering::Relaxed);
+                        } else if ft.is_dir() {
+                            dirs.fetch_add(1, Ordering::Relaxed);
+                            local_dirs.push((e.path().to_path_buf(), 0));
+                            // Flush every 100 dirs
+                            if local_dirs.len() >= 100 {
+                                let mut m = map.lock().unwrap();
+                                for (p, s) in local_dirs.drain(..) {
+                                    m.insert(p, s);
+                                }
+                            }
+                        }
+                    }
+                }
+                ignore::WalkState::Continue
+            })
+        });
+
+        let elapsed = start.elapsed();
+        let map_entries = map.lock().unwrap().len();
+        let r = BenchResult {
+            files: files.load(Ordering::Relaxed),
+            dirs: dirs.load(Ordering::Relaxed),
+            bytes: bytes.load(Ordering::Relaxed),
+            elapsed,
+        };
+        print_result(&r);
+        println!("  HashMap entries: {}", map_entries);
+        println!();
+    }
+
+    // ── Mode 7: jwalk parallel walker ──────────────────────────────────
+    println!("=== Mode 7: jwalk::WalkDir (parallel walker) ===");
+    {
+        let files = Arc::new(AtomicU64::new(0));
+        let dirs = Arc::new(AtomicU64::new(0));
+        let bytes = Arc::new(AtomicU64::new(0));
+
+        let start = Instant::now();
+
+        let walk = jwalk::WalkDir::new(&root)
+            .follow_links(false)
+            .parallelism(jwalk::Parallelism::RayonNewPool(num_cpus::get().max(2)));
+
+        for entry in walk {
+            if let Ok(e) = entry {
+                if e.file_type().is_file() {
+                    files.fetch_add(1, Ordering::Relaxed);
+                    let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                    bytes.fetch_add(len, Ordering::Relaxed);
+                } else if e.file_type().is_dir() {
+                    dirs.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let elapsed = start.elapsed();
+        let r = BenchResult {
+            files: files.load(Ordering::Relaxed),
+            dirs: dirs.load(Ordering::Relaxed),
+            bytes: bytes.load(Ordering::Relaxed),
+            elapsed,
+        };
+        print_result(&r);
+    }
+
+    // ── Mode 8: jwalk + HashMap ──────────────────────────────────────────
+    println!("=== Mode 8: jwalk + shared HashMap ===");
+    {
+        let files = Arc::new(AtomicU64::new(0));
+        let dirs_count = Arc::new(AtomicU64::new(0));
+        let bytes = Arc::new(AtomicU64::new(0));
+        let map: Arc<Mutex<HashMap<PathBuf, u64>>> =
+            Arc::new(Mutex::new(HashMap::with_capacity(100_000)));
+
+        let start = Instant::now();
+
+        let walk = jwalk::WalkDir::new(&root)
+            .follow_links(false)
+            .parallelism(jwalk::Parallelism::RayonNewPool(num_cpus::get().max(2)));
+
+        let mut local_batch: Vec<(PathBuf, u64)> = Vec::new();
+
+        for entry in walk {
+            if let Ok(e) = entry {
+                if e.file_type().is_file() {
+                    files.fetch_add(1, Ordering::Relaxed);
+                    let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                    bytes.fetch_add(len, Ordering::Relaxed);
+                } else if e.file_type().is_dir() {
+                    dirs_count.fetch_add(1, Ordering::Relaxed);
+                    local_batch.push((e.path(), 0));
+                    if local_batch.len() >= 100 {
+                        let mut m = map.lock().unwrap();
+                        for (p, s) in local_batch.drain(..) {
+                            m.insert(p, s);
+                        }
+                    }
+                }
+            }
+        }
+        // flush remaining
+        if !local_batch.is_empty() {
+            let mut m = map.lock().unwrap();
+            for (p, s) in local_batch.drain(..) {
+                m.insert(p, s);
+            }
+        }
+
+        let elapsed = start.elapsed();
+        let map_entries = map.lock().unwrap().len();
+        let r = BenchResult {
+            files: files.load(Ordering::Relaxed),
+            dirs: dirs_count.load(Ordering::Relaxed),
+            bytes: bytes.load(Ordering::Relaxed),
+            elapsed,
+        };
+        print_result(&r);
+        println!("  HashMap entries: {}", map_entries);
+        println!();
+    }
+
     println!("Done. Compare the files/sec between modes to identify the bottleneck.");
 }
 

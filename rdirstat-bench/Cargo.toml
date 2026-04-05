@@ -5,4 +5,6 @@ edition = "2021"
 
 [dependencies]
 walkdir = "2"
+ignore = "0.4"
+jwalk = "0.8"
 num_cpus = "1.16"

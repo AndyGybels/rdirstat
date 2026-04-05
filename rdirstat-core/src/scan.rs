@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::{fs, thread};
+use std::thread;
+
+use ignore::WalkBuilder;
 
 use crate::logging::log;
 use crate::util::strip_unc_prefix;
@@ -59,6 +61,7 @@ pub struct ScanState {
 }
 
 const TOP_N: usize = 10;
+const FLUSH_INTERVAL: u64 = 5000;
 
 impl ScanState {
     pub fn new() -> Arc<Self> {
@@ -207,143 +210,111 @@ impl ScanState {
     }
 }
 
-/// Walk a single subtree, tracking sizes for every directory encountered.
-fn scan_subtree(subtree_root: PathBuf, state: &ScanState, cancel: &AtomicBool) -> u64 {
-    let mut dir_stack: Vec<(PathBuf, u64)> = Vec::new();
-    let mut local_count = 0u64;
-    let mut errors = 0u64;
-    let flush_interval = 5000;
-
-    // Thread-local extension stats — merged once at the end
-    let mut local_ext_stats: HashMap<String, (u64, u64)> = HashMap::new();
-
-    // Batch completed dirs, flush under one lock
-    let mut completed_batch: Vec<(PathBuf, u64)> = Vec::new();
-
-    // Track deepest path locally, write once at end
-    let mut local_deepest: (PathBuf, usize) = (PathBuf::new(), 0);
-
-    for entry in walkdir::WalkDir::new(&subtree_root).follow_links(false) {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-
-        match entry {
-            Ok(e) => {
-                let depth = e.depth();
-
-                // Complete directories that we've moved past — batch them
-                while dir_stack.len() > depth {
-                    if let Some((done_dir, size)) = dir_stack.pop() {
-                        completed_batch.push((done_dir, size));
-                        if let Some(parent) = dir_stack.last_mut() {
-                            parent.1 += size;
-                        }
-                    }
-                }
-
-                // Flush completed batch if it has entries
-                if !completed_batch.is_empty() {
-                    {
-                        let mut sizes = state.dir_sizes.lock().unwrap();
-                        let mut comp = state.completed.lock().unwrap();
-                        for (dir, size) in &completed_batch {
-                            sizes.insert(dir.clone(), *size);
-                            comp.insert(dir.clone());
-                        }
-                    }
-                    for (dir, size) in completed_batch.drain(..) {
-                        state.record_completed_dir(&dir, size);
-                    }
-                }
-
-                if e.file_type().is_dir() {
-                    let path = strip_unc_prefix(e.path().to_path_buf());
-                    state.record_dir(depth);
-                    if depth > local_deepest.1 {
-                        local_deepest = (path.clone(), depth);
-                    }
-                    dir_stack.push((path, 0));
-                } else if e.file_type().is_file() {
-                    let len = e.metadata().map(|m| m.len()).unwrap_or(0);
-                    let file_path = strip_unc_prefix(e.path().to_path_buf());
-
-                    state.total_bytes.fetch_add(len, Ordering::Relaxed);
-                    state.record_top_file(&file_path, len);
-
-                    // Extension stats — thread-local, no lock
-                    if let Some(ext) = file_path.extension() {
-                        let ext = ext.to_string_lossy().to_lowercase();
-                        let entry = local_ext_stats.entry(ext).or_insert((0, 0));
-                        entry.0 += 1;
-                        entry.1 += len;
-                    }
-
-                    if let Some(parent) = dir_stack.last_mut() {
-                        parent.1 += len;
-                    }
-                    local_count += 1;
-
-                    if local_count % flush_interval == 0 {
-                        // Only write the subtree root's cumulative total — 1 insert
-                        if !dir_stack.is_empty() {
-                            let subtree_total: u64 = dir_stack.iter().map(|(_, s)| s).sum();
-                            state.dir_sizes.lock().unwrap()
-                                .insert(dir_stack[0].0.clone(), subtree_total);
-                        }
-                        state.files_scanned.fetch_add(flush_interval, Ordering::Relaxed);
-                    }
-                }
-            }
-            Err(e) => {
-                if errors < 5 {
-                    log(&format!("scan: walkdir error in {}: {e}", subtree_root.display()));
-                }
-                errors += 1;
-            }
-        }
-    }
-
-    // Flush remaining directories — one lock for all
-    let mut total = 0u64;
-    {
-        let mut sizes = state.dir_sizes.lock().unwrap();
-        let mut comp = state.completed.lock().unwrap();
-        while let Some((done_dir, size)) = dir_stack.pop() {
-            sizes.insert(done_dir.clone(), size);
-            comp.insert(done_dir.clone());
-            // Can't call record_completed_dir while holding locks, so batch
-            completed_batch.push((done_dir, size));
-            if let Some(parent) = dir_stack.last_mut() {
-                parent.1 += size;
-            } else {
-                total = size;
-            }
-        }
-    }
-    for (dir, size) in completed_batch.drain(..) {
-        state.record_completed_dir(&dir, size);
-    }
-
-    state.files_scanned.fetch_add(local_count % flush_interval, Ordering::Relaxed);
-
-    // Merge thread-local stats — one lock each
-    state.merge_ext_stats(&local_ext_stats);
-    state.refresh_top_exts(15);
-
-    // Update deepest path if this subtree had a deeper one
-    if local_deepest.1 > 0 {
-        state.set_deepest_path(&local_deepest.0, local_deepest.1);
-    }
-
-    if errors > 0 {
-        log(&format!("scan: subtree {} done with {errors} errors", subtree_root.display()));
-    }
-    total
+/// Thread-local state for each parallel walker thread.
+/// Flushes remaining data to shared ScanState on drop.
+struct ThreadLocalState {
+    state: Arc<ScanState>,
+    root: PathBuf,
+    local_dir_sizes: HashMap<PathBuf, u64>,
+    local_ext_stats: HashMap<String, (u64, u64)>,
+    local_count: u64,
+    local_deepest: (PathBuf, usize),
+    errors: u64,
 }
 
-/// Start the background scanner. Enumerates top-level children of `root`,
-/// then spawns parallel walker threads via a thread pool.
+impl ThreadLocalState {
+    fn new(state: Arc<ScanState>, root: PathBuf) -> Self {
+        ThreadLocalState {
+            state,
+            root,
+            local_dir_sizes: HashMap::new(),
+            local_ext_stats: HashMap::new(),
+            local_count: 0,
+            local_deepest: (PathBuf::new(), 0),
+            errors: 0,
+        }
+    }
+
+    fn flush_dir_sizes(&mut self) {
+        if self.local_dir_sizes.is_empty() {
+            return;
+        }
+        let mut sizes = self.state.dir_sizes.lock().unwrap();
+        for (dir, size) in self.local_dir_sizes.drain() {
+            *sizes.entry(dir).or_insert(0) += size;
+        }
+    }
+
+    fn process_entry(&mut self, entry: ignore::DirEntry) {
+        let depth = entry.depth();
+        let path = strip_unc_prefix(entry.path().to_path_buf());
+
+        if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            self.state.record_dir(depth);
+            if depth > self.local_deepest.1 {
+                self.local_deepest = (path, depth);
+            }
+        } else if entry.file_type().map_or(false, |ft| ft.is_file()) {
+            let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+
+            self.state.total_bytes.fetch_add(len, Ordering::Relaxed);
+            self.state.record_top_file(&path, len);
+
+            // Extension stats — thread-local, no lock
+            if let Some(ext) = path.extension() {
+                let ext = ext.to_string_lossy().to_lowercase();
+                let e = self.local_ext_stats.entry(ext).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += len;
+            }
+
+            // Accumulate size to all ancestor directories up to root
+            let mut p = path.parent();
+            while let Some(dir) = p {
+                *self.local_dir_sizes.entry(dir.to_path_buf()).or_insert(0) += len;
+                if dir == self.root.as_path() {
+                    break;
+                }
+                p = dir.parent();
+            }
+
+            self.local_count += 1;
+
+            if self.local_count % FLUSH_INTERVAL == 0 {
+                self.flush_dir_sizes();
+                self.state.files_scanned.fetch_add(FLUSH_INTERVAL, Ordering::Relaxed);
+                self.state.merge_ext_stats(&self.local_ext_stats);
+                self.local_ext_stats.clear();
+                self.state.refresh_top_exts(15);
+            }
+        }
+    }
+}
+
+impl Drop for ThreadLocalState {
+    fn drop(&mut self) {
+        // Flush remaining dir sizes
+        self.flush_dir_sizes();
+        // Flush remaining file count
+        let remainder = self.local_count % FLUSH_INTERVAL;
+        if remainder > 0 {
+            self.state.files_scanned.fetch_add(remainder, Ordering::Relaxed);
+        }
+        // Merge remaining ext stats
+        if !self.local_ext_stats.is_empty() {
+            self.state.merge_ext_stats(&self.local_ext_stats);
+        }
+        // Update deepest path if this thread found a deeper one
+        if self.local_deepest.1 > 0 {
+            self.state.set_deepest_path(&self.local_deepest.0, self.local_deepest.1);
+        }
+        if self.errors > 0 {
+            log(&format!("scan: thread finished with {} errors", self.errors));
+        }
+    }
+}
+
+/// Start the background scanner using the `ignore` crate's parallel walker.
 pub fn start_scan(root: PathBuf, state: Arc<ScanState>) {
     state.cancel.store(false, Ordering::Relaxed);
     *state.scan_start.lock().unwrap() = Some(std::time::Instant::now());
@@ -351,84 +322,58 @@ pub fn start_scan(root: PathBuf, state: Arc<ScanState>) {
     log(&format!("scan: starting from {}", root.display()));
 
     thread::spawn(move || {
-        let mut child_dirs: Vec<PathBuf> = Vec::new();
-        let mut root_file_size = 0u64;
-
-        if let Ok(read_dir) = fs::read_dir(&root) {
-            for entry in read_dir.flatten() {
-                if let Ok(ft) = entry.file_type() {
-                    let path = strip_unc_prefix(entry.path());
-                    if ft.is_dir() {
-                        child_dirs.push(path);
-                    } else if ft.is_file() {
-                        root_file_size += entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    }
-                }
-            }
-        }
-
-        log(&format!("scan: {} top-level dirs to scan", child_dirs.len()));
-
         let num_threads = num_cpus::get().max(2);
-        let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
-        let rx = Arc::new(Mutex::new(rx));
-        let workers_active = Arc::new(AtomicU64::new(num_threads as u64));
 
-        let mut handles = Vec::new();
-        for _ in 0..num_threads {
-            let rx = Arc::clone(&rx);
+        let walker = WalkBuilder::new(&root)
+            .hidden(false)
+            .ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .follow_links(false)
+            .threads(num_threads)
+            .build_parallel();
+
+        walker.run(|| {
             let state = Arc::clone(&state);
-            let active = Arc::clone(&workers_active);
-            handles.push(thread::spawn(move || {
-                loop {
-                    let path = {
-                        let lock = rx.lock().unwrap();
-                        match lock.recv() {
-                            Ok(p) => p,
-                            Err(_) => break,
-                        }
-                    };
-                    if state.cancel.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    log(&format!("worker: scanning {}", path.display()));
-                    scan_subtree(path, &state, &state.cancel);
+            let root = root.clone();
+            let mut tls = ThreadLocalState::new(state, root);
+
+            Box::new(move |result| {
+                if tls.state.cancel.load(Ordering::Relaxed) {
+                    return ignore::WalkState::Quit;
                 }
-                active.fetch_sub(1, Ordering::Relaxed);
-            }));
-        }
 
-        for dir in child_dirs {
-            if state.cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let _ = tx.send(dir);
-        }
-        drop(tx);
+                match result {
+                    Ok(entry) => tls.process_entry(entry),
+                    Err(e) => {
+                        if tls.errors < 5 {
+                            log(&format!("scan: walker error: {e}"));
+                        }
+                        tls.errors += 1;
+                    }
+                }
 
-        for h in handles {
-            let _ = h.join();
-        }
+                ignore::WalkState::Continue
+            })
+        });
 
-        // Compute root directory size
-        {
+        // After walk completes: mark all directories as completed, find top dirs
+        let entries: Vec<(PathBuf, u64)> = {
             let sizes = state.dir_sizes.lock().unwrap();
-            let mut root_total = root_file_size;
-            if let Ok(read_dir) = fs::read_dir(&root) {
-                for entry in read_dir.flatten() {
-                    if let Ok(ft) = entry.file_type() {
-                        if ft.is_dir() {
-                            let path = strip_unc_prefix(entry.path());
-                            root_total += sizes.get(&path).copied().unwrap_or(0);
-                        }
-                    }
-                }
+            sizes.iter().map(|(p, &s)| (p.clone(), s)).collect()
+        };
+        {
+            let mut comp = state.completed.lock().unwrap();
+            for (dir, _) in &entries {
+                comp.insert(dir.clone());
             }
-            drop(sizes);
-            state.dir_sizes.lock().unwrap().insert(root.clone(), root_total);
-            state.completed.lock().unwrap().insert(root);
+        }
+        for (dir, size) in &entries {
+            state.record_completed_dir(dir, *size);
         }
 
+        state.refresh_top_exts(15);
         state.scanning.store(false, Ordering::Release);
         log(&format!("scan: finished, {} files", state.files_scanned()));
     });

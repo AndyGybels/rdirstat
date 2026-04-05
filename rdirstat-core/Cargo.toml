@@ -5,5 +5,5 @@ edition = "2021"
 
 [dependencies]
 chrono = "0.4"
+ignore = "0.4"
 num_cpus = "1.16"
-walkdir = "2"
