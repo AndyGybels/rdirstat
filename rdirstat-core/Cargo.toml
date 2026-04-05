@@ -1,0 +1,9 @@
+[package]
+name = "rdirstat-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = "0.4"
+num_cpus = "1.16"
+walkdir = "2"

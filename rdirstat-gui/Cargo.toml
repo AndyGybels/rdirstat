@@ -1,0 +1,9 @@
+[package]
+name = "rdirstat-gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rdirstat-core = { path = "../rdirstat-core" }
+eframe = "0.31"
+egui_extras = "0.31"
