@@ -63,16 +63,31 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/rdirstat.exe dist/rdirstat-${{ matrix.target }}.exe
-          cp target/${{ matrix.target }}/release/rdirstat-gui.exe dist/rdirstat-gui-${{ matrix.target }}.exe
-          cd dist
-          7z a rdirstat-${{ matrix.target }}.zip rdirstat-${{ matrix.target }}.exe rdirstat-gui-${{ matrix.target }}.exe
+          cp target/${{ matrix.target }}/release/rdirstat.exe dist/rdirstat.exe
+          cp target/${{ matrix.target }}/release/rdirstat-gui.exe dist/rdirstat-gui.exe
 
-      - name: Upload artifacts
+      - name: Build Windows installer (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          set TAG=${{ github.ref_name }}
+          set VERSION=%TAG:v=%
+          iscc /DMyAppVersion=%VERSION% installer\windows.iss
+          move /Y installer\Output\rdirstat-setup-x86_64.exe dist\rdirstat-setup-x86_64.exe
+
+      - name: Upload artifacts (Unix)
+        if: runner.os != 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: binaries-${{ matrix.target }}
           path: dist/rdirstat-${{ matrix.target }}.*
+
+      - name: Upload artifacts (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/rdirstat-setup-x86_64.exe
 
   deb:
     runs-on: ubuntu-latest
