@@ -505,3 +505,421 @@ pub fn start_scan(root: PathBuf, state: Arc<ScanState>) {
         log(&format!("scan: finished, {} files", state.files_scanned()));
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // --- ScanState::new ---
+
+    #[test]
+    fn new_state_defaults() {
+        let state = ScanState::new();
+        assert!(!state.is_scanning());
+        assert_eq!(state.files_scanned(), 0);
+        assert_eq!(state.total_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(state.dirs_scanned.load(Ordering::Relaxed), 0);
+        assert!(state.top_files.lock().unwrap().is_empty());
+        assert!(state.top_dirs.lock().unwrap().is_empty());
+        assert!(state.top_exts_cache.lock().unwrap().is_empty());
+        assert_eq!(state.deepest_path.lock().unwrap().1, 0);
+        assert!(state.scan_start.lock().unwrap().is_none());
+    }
+
+    // --- get_size / dir_sizes ---
+
+    #[test]
+    fn get_size_empty() {
+        let state = ScanState::new();
+        assert_eq!(state.get_size(Path::new("/foo")), None);
+    }
+
+    #[test]
+    fn get_size_after_insert() {
+        let state = ScanState::new();
+        state.dir_sizes.lock().unwrap().insert(PathBuf::from("/foo"), 42);
+        assert_eq!(state.get_size(Path::new("/foo")), Some(42));
+    }
+
+    // --- is_completed ---
+
+    #[test]
+    fn is_completed_empty() {
+        let state = ScanState::new();
+        assert!(!state.is_completed(Path::new("/foo")));
+    }
+
+    #[test]
+    fn is_completed_after_insert() {
+        let state = ScanState::new();
+        state.completed.lock().unwrap().insert(PathBuf::from("/foo"));
+        assert!(state.is_completed(Path::new("/foo")));
+    }
+
+    // --- is_scanning / files_scanned ---
+
+    #[test]
+    fn scanning_toggle() {
+        let state = ScanState::new();
+        assert!(!state.is_scanning());
+        state.scanning.store(true, Ordering::Relaxed);
+        assert!(state.is_scanning());
+        state.scanning.store(false, Ordering::Relaxed);
+        assert!(!state.is_scanning());
+    }
+
+    #[test]
+    fn files_scanned_increment() {
+        let state = ScanState::new();
+        state.files_scanned.fetch_add(100, Ordering::Relaxed);
+        assert_eq!(state.files_scanned(), 100);
+        state.files_scanned.fetch_add(50, Ordering::Relaxed);
+        assert_eq!(state.files_scanned(), 150);
+    }
+
+    // --- record_top_file ---
+
+    #[test]
+    fn record_top_file_basic() {
+        let state = ScanState::new();
+        state.record_top_file(Path::new("/big"), 1000);
+        let top = state.top_files.lock().unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].size, 1000);
+        assert_eq!(top[0].path, Path::new("/big"));
+    }
+
+    #[test]
+    fn record_top_file_skips_small() {
+        let state = ScanState::new();
+        // Fill with TOP_N entries of size 100
+        for i in 0..TOP_N {
+            state.record_top_file(&PathBuf::from(format!("/f{i}")), 100);
+        }
+        // A file with size 50 should be skipped (below min threshold)
+        state.record_top_file(Path::new("/small"), 50);
+        let top = state.top_files.lock().unwrap();
+        assert_eq!(top.len(), TOP_N);
+        assert!(top.iter().all(|e| e.size == 100));
+    }
+
+    #[test]
+    fn record_top_file_sorted_descending() {
+        let state = ScanState::new();
+        state.record_top_file(Path::new("/a"), 10);
+        state.record_top_file(Path::new("/b"), 30);
+        state.record_top_file(Path::new("/c"), 20);
+        let top = state.top_files.lock().unwrap();
+        assert_eq!(top[0].size, 30);
+        assert_eq!(top[1].size, 20);
+        assert_eq!(top[2].size, 10);
+    }
+
+    #[test]
+    fn record_top_file_truncates_to_top_n() {
+        let state = ScanState::new();
+        for i in 0..(TOP_N + 5) {
+            state.record_top_file(&PathBuf::from(format!("/f{i}")), (i + 1) as u64);
+        }
+        let top = state.top_files.lock().unwrap();
+        assert_eq!(top.len(), TOP_N);
+        // Largest should be first
+        assert_eq!(top[0].size, (TOP_N + 5) as u64);
+    }
+
+    // --- record_dir ---
+
+    #[test]
+    fn record_dir_increments_count() {
+        let state = ScanState::new();
+        state.record_dir(1);
+        state.record_dir(2);
+        state.record_dir(3);
+        assert_eq!(state.dirs_scanned.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn record_dir_tracks_deepest() {
+        let state = ScanState::new();
+        state.record_dir(5);
+        state.record_dir(3);
+        state.record_dir(10);
+        state.record_dir(7);
+        assert_eq!(state.deepest_depth.load(Ordering::Relaxed), 10);
+    }
+
+    // --- set_deepest_path ---
+
+    #[test]
+    fn set_deepest_path_basic() {
+        let state = ScanState::new();
+        state.set_deepest_path(Path::new("/a/b/c"), 3);
+        let (path, depth) = state.deepest_path.lock().unwrap().clone();
+        assert_eq!(path, Path::new("/a/b/c"));
+        assert_eq!(depth, 3);
+    }
+
+    #[test]
+    fn set_deepest_path_only_deeper() {
+        let state = ScanState::new();
+        state.set_deepest_path(Path::new("/deep"), 10);
+        state.set_deepest_path(Path::new("/shallow"), 5);
+        let (path, depth) = state.deepest_path.lock().unwrap().clone();
+        assert_eq!(path, Path::new("/deep"));
+        assert_eq!(depth, 10);
+    }
+
+    #[test]
+    fn set_deepest_path_updates_deeper() {
+        let state = ScanState::new();
+        state.set_deepest_path(Path::new("/a"), 5);
+        state.set_deepest_path(Path::new("/b"), 15);
+        let (path, depth) = state.deepest_path.lock().unwrap().clone();
+        assert_eq!(path, Path::new("/b"));
+        assert_eq!(depth, 15);
+    }
+
+    // --- record_completed_dir ---
+
+    #[test]
+    fn record_completed_dir_basic() {
+        let state = ScanState::new();
+        state.record_completed_dir(Path::new("/big_dir"), 5000);
+        let top = state.top_dirs.lock().unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].size, 5000);
+    }
+
+    #[test]
+    fn record_completed_dir_dedup() {
+        let state = ScanState::new();
+        state.record_completed_dir(Path::new("/dir"), 100);
+        state.record_completed_dir(Path::new("/dir"), 200);
+        let top = state.top_dirs.lock().unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].size, 200); // updated, not duplicated
+    }
+
+    #[test]
+    fn record_completed_dir_sorted_truncated() {
+        let state = ScanState::new();
+        for i in 0..(TOP_N + 3) {
+            state.record_completed_dir(
+                &PathBuf::from(format!("/d{i}")),
+                (i + 1) as u64 * 100,
+            );
+        }
+        let top = state.top_dirs.lock().unwrap();
+        assert_eq!(top.len(), TOP_N);
+        assert_eq!(top[0].size, (TOP_N + 3) as u64 * 100);
+    }
+
+    // --- merge_ext_stats ---
+
+    #[test]
+    fn merge_ext_stats_empty() {
+        let state = ScanState::new();
+        let local = HashMap::new();
+        state.merge_ext_stats(&local);
+        assert!(state.ext_stats.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn merge_ext_stats_single() {
+        let state = ScanState::new();
+        let mut local = HashMap::new();
+        local.insert("txt".to_string(), (5, 1000));
+        state.merge_ext_stats(&local);
+        let stats = state.ext_stats.lock().unwrap();
+        assert_eq!(stats.get("txt"), Some(&(5, 1000)));
+    }
+
+    #[test]
+    fn merge_ext_stats_accumulates() {
+        let state = ScanState::new();
+        let mut local1 = HashMap::new();
+        local1.insert("txt".to_string(), (3, 300));
+        state.merge_ext_stats(&local1);
+
+        let mut local2 = HashMap::new();
+        local2.insert("txt".to_string(), (2, 200));
+        local2.insert("rs".to_string(), (1, 100));
+        state.merge_ext_stats(&local2);
+
+        let stats = state.ext_stats.lock().unwrap();
+        assert_eq!(stats.get("txt"), Some(&(5, 500)));
+        assert_eq!(stats.get("rs"), Some(&(1, 100)));
+    }
+
+    // --- refresh_top_exts ---
+
+    #[test]
+    fn refresh_top_exts_sorts_and_truncates() {
+        let state = ScanState::new();
+        {
+            let mut stats = state.ext_stats.lock().unwrap();
+            stats.insert("a".to_string(), (1, 100));
+            stats.insert("b".to_string(), (1, 300));
+            stats.insert("c".to_string(), (1, 200));
+        }
+        state.refresh_top_exts(2);
+        let cache = state.top_exts_cache.lock().unwrap();
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache[0].extension, "b");
+        assert_eq!(cache[0].total_size, 300);
+        assert_eq!(cache[1].extension, "c");
+        assert_eq!(cache[1].total_size, 200);
+    }
+
+    // --- clear ---
+
+    #[test]
+    fn clear_resets_everything() {
+        let state = ScanState::new();
+        // Populate various fields
+        state.dir_sizes.lock().unwrap().insert(PathBuf::from("/x"), 10);
+        state.completed.lock().unwrap().insert(PathBuf::from("/x"));
+        state.files_scanned.store(999, Ordering::Relaxed);
+        state.scanning.store(true, Ordering::Relaxed);
+        state.record_top_file(Path::new("/big"), 9999);
+        state.record_completed_dir(Path::new("/d"), 8888);
+        state.total_bytes.store(77777, Ordering::Relaxed);
+        state.dirs_scanned.store(555, Ordering::Relaxed);
+        state.set_deepest_path(Path::new("/deep"), 20);
+        *state.scan_start.lock().unwrap() = Some(std::time::Instant::now());
+
+        state.clear();
+
+        assert!(state.dir_sizes.lock().unwrap().is_empty());
+        assert!(state.completed.lock().unwrap().is_empty());
+        assert_eq!(state.files_scanned(), 0);
+        assert!(state.top_files.lock().unwrap().is_empty());
+        assert!(state.top_dirs.lock().unwrap().is_empty());
+        assert_eq!(state.total_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(state.dirs_scanned.load(Ordering::Relaxed), 0);
+        assert_eq!(state.deepest_path.lock().unwrap().1, 0);
+        assert!(state.scan_start.lock().unwrap().is_none());
+    }
+
+    // --- process_completions ---
+
+    #[test]
+    fn process_completions_empty() {
+        let state = ScanState::new();
+        let mut yielded = HashMap::new();
+        let result = state.process_completions(&mut yielded, Path::new("/root"));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn process_completions_not_ready() {
+        let state = ScanState::new();
+        // Register a dir with expected=3
+        {
+            let mut comp = state.dir_completion.lock().unwrap();
+            comp.insert(PathBuf::from("/root/a"), (0, 3));
+        }
+        // Yield only 2
+        let mut yielded = HashMap::new();
+        yielded.insert(PathBuf::from("/root/a"), 2);
+        let result = state.process_completions(&mut yielded, Path::new("/root"));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn process_completions_completes() {
+        let state = ScanState::new();
+        {
+            let mut comp = state.dir_completion.lock().unwrap();
+            comp.insert(PathBuf::from("/root/a"), (0, 3));
+        }
+        let mut yielded = HashMap::new();
+        yielded.insert(PathBuf::from("/root/a"), 3);
+        let result = state.process_completions(&mut yielded, Path::new("/root"));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], PathBuf::from("/root/a"));
+    }
+
+    #[test]
+    fn process_completions_cascades_to_parent() {
+        let state = ScanState::new();
+        {
+            let mut comp = state.dir_completion.lock().unwrap();
+            // /root/a expects 2 entries, has 1 yielded (needs 1 more from child completing)
+            comp.insert(PathBuf::from("/root/a"), (1, 2));
+            // /root/a/b expects 1 entry, has 0 yielded
+            comp.insert(PathBuf::from("/root/a/b"), (0, 1));
+        }
+        // Yield 1 to /root/a/b → it completes → cascades +1 to /root/a → /root/a completes
+        let mut yielded = HashMap::new();
+        yielded.insert(PathBuf::from("/root/a/b"), 1);
+        let result = state.process_completions(&mut yielded, Path::new("/root"));
+        assert!(result.contains(&PathBuf::from("/root/a/b")));
+        assert!(result.contains(&PathBuf::from("/root/a")));
+    }
+
+    #[test]
+    fn process_completions_stops_at_root() {
+        let state = ScanState::new();
+        {
+            let mut comp = state.dir_completion.lock().unwrap();
+            comp.insert(PathBuf::from("/root"), (0, 1));
+        }
+        let mut yielded = HashMap::new();
+        yielded.insert(PathBuf::from("/root"), 1);
+        let result = state.process_completions(&mut yielded, Path::new("/root"));
+        assert_eq!(result, vec![PathBuf::from("/root")]);
+        // Should not cascade above root
+    }
+
+    // --- start_scan integration ---
+
+    #[test]
+    fn start_scan_on_temp_dir() {
+        let tmp = std::env::temp_dir().join("rdirstat_test_scan");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("sub")).unwrap();
+        fs::write(tmp.join("file.txt"), "hello").unwrap();
+        fs::write(tmp.join("sub/inner.txt"), "world!").unwrap();
+
+        let state = ScanState::new();
+        start_scan(tmp.clone(), Arc::clone(&state));
+
+        // Wait for scan to finish
+        for _ in 0..200 {
+            if !state.is_scanning() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(!state.is_scanning());
+        assert!(state.files_scanned() >= 2);
+        assert!(state.total_bytes.load(Ordering::Relaxed) >= 11);
+        assert!(state.is_completed(&tmp));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn start_scan_cancel() {
+        let tmp = std::env::temp_dir().join("rdirstat_test_cancel");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("f.txt"), "x").unwrap();
+
+        let state = ScanState::new();
+        start_scan(tmp.clone(), Arc::clone(&state));
+        state.cancel.store(true, Ordering::Relaxed);
+
+        for _ in 0..200 {
+            if !state.is_scanning() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(!state.is_scanning());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}

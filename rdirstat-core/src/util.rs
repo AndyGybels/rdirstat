@@ -27,3 +27,69 @@ pub fn format_size(bytes: u64) -> String {
         format!("{} B", bytes)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_unc_prefix_removes_prefix() {
+        let path = PathBuf::from(r"\\?\C:\Users\test");
+        assert_eq!(strip_unc_prefix(path), PathBuf::from(r"C:\Users\test"));
+    }
+
+    #[test]
+    fn strip_unc_prefix_no_prefix() {
+        let path = PathBuf::from(r"C:\Users\test");
+        assert_eq!(strip_unc_prefix(path.clone()), path);
+    }
+
+    #[test]
+    fn strip_unc_prefix_empty() {
+        let path = PathBuf::from("");
+        assert_eq!(strip_unc_prefix(path.clone()), path);
+    }
+
+    #[test]
+    fn strip_unc_prefix_unix_path() {
+        let path = PathBuf::from("/home/user");
+        assert_eq!(strip_unc_prefix(path.clone()), path);
+    }
+
+    #[test]
+    fn format_size_zero() {
+        assert_eq!(format_size(0), "0 B");
+    }
+
+    #[test]
+    fn format_size_bytes() {
+        assert_eq!(format_size(1), "1 B");
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(1023), "1023 B");
+    }
+
+    #[test]
+    fn format_size_kb() {
+        assert_eq!(format_size(1024), "1.0 KB");
+        assert_eq!(format_size(1536), "1.5 KB");
+        assert_eq!(format_size(1024 * 1023), "1023.0 KB");
+    }
+
+    #[test]
+    fn format_size_mb() {
+        assert_eq!(format_size(1024 * 1024), "1.0 MB");
+        assert_eq!(format_size(1024 * 1024 * 5 + 1024 * 512), "5.5 MB");
+    }
+
+    #[test]
+    fn format_size_gb() {
+        assert_eq!(format_size(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(format_size(1024u64 * 1024 * 1024 * 100), "100.0 GB");
+    }
+
+    #[test]
+    fn format_size_tb() {
+        assert_eq!(format_size(1024u64 * 1024 * 1024 * 1024), "1.0 TB");
+        assert_eq!(format_size(1024u64 * 1024 * 1024 * 1024 * 2), "2.0 TB");
+    }
+}

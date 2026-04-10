@@ -41,3 +41,22 @@ pub fn log(msg: &str) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_without_init_does_not_panic() {
+        // log() should be a no-op when logger isn't initialized
+        log("test message that should not panic");
+    }
+
+    #[test]
+    fn init_and_log() {
+        init_logger();
+        log("unit test log entry");
+        // Verify log file was created
+        assert!(std::path::Path::new("rdirstat.log").exists());
+    }
+}

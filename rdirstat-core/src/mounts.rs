@@ -87,3 +87,41 @@ fn list_mounts_unix() -> Vec<MountPoint> {
 
     mounts
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_mounts_returns_results() {
+        let mounts = list_mounts();
+        assert!(!mounts.is_empty());
+    }
+
+    #[test]
+    fn list_mounts_paths_exist() {
+        let mounts = list_mounts();
+        for m in &mounts {
+            assert!(m.path.exists(), "mount path {:?} should exist", m.path);
+        }
+    }
+
+    #[test]
+    fn list_mounts_labels_not_empty() {
+        let mounts = list_mounts();
+        for m in &mounts {
+            assert!(!m.label.is_empty(), "mount label should not be empty");
+        }
+    }
+
+    #[test]
+    fn mount_point_clone() {
+        let mp = MountPoint {
+            path: PathBuf::from("/test"),
+            label: "test".to_string(),
+        };
+        let cloned = mp.clone();
+        assert_eq!(cloned.path, mp.path);
+        assert_eq!(cloned.label, mp.label);
+    }
+}

@@ -331,3 +331,367 @@ impl AppState {
         self.load_entries();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::AtomicU64;
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn setup_test_dir() -> PathBuf {
+        let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tid = std::thread::current().id();
+        let tmp = std::env::temp_dir().join(format!("rdirstat_test_app_{id}_{tid:?}"));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("alpha")).unwrap();
+        fs::create_dir_all(tmp.join("beta")).unwrap();
+        fs::write(tmp.join("file_a.txt"), "aaaa").unwrap();
+        fs::write(tmp.join("file_b.txt"), "bb").unwrap();
+        fs::write(tmp.join("alpha/inner.txt"), "inside").unwrap();
+        tmp
+    }
+
+    fn cleanup(tmp: &Path) {
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn new_idle_does_not_scan() {
+        let tmp = setup_test_dir();
+        let app = AppState::new_idle(&tmp);
+        assert!(!app.has_scanned());
+        assert!(!app.scan_state.is_scanning());
+        assert_eq!(app.current_dir, tmp);
+        assert_eq!(app.scan_root, tmp);
+        assert!(!app.entries.is_empty());
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn load_entries_has_parent_and_children() {
+        let tmp = setup_test_dir();
+        let app = AppState::new_idle(&tmp);
+        // Should have: "..", "alpha", "beta", "file_a.txt", "file_b.txt"
+        assert!(app.entries.len() >= 5);
+        // First entry should be ".." (parent)
+        assert!(app.entries[0].is_parent);
+        assert_eq!(app.entries[0].name, "..");
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn sort_entries_by_name() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        app.sort_by_size.store(false, Ordering::Relaxed);
+        app.sort_entries();
+        // Skip parent "..", rest should be alphabetical
+        let names: Vec<&str> = app.entries.iter().skip(1).map(|e| e.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        assert_eq!(names, sorted);
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn total_size_sums_entries() {
+        let tmp = setup_test_dir();
+        let app = AppState::new_idle(&tmp);
+        let total = app.total_size();
+        // file_a.txt = 4, file_b.txt = 2, dirs = 0 (no scan data)
+        assert!(total >= 6);
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn enter_dir_navigates() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        // Find "alpha" directory
+        let alpha_idx = app.entries.iter().position(|e| e.name == "alpha").unwrap();
+        app.selected = alpha_idx;
+        app.enter_dir();
+        assert_eq!(app.current_dir, tmp.join("alpha"));
+        assert_eq!(app.history.len(), 1);
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn enter_dir_on_file_does_nothing() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        let file_idx = app.entries.iter().position(|e| e.name == "file_a.txt").unwrap();
+        app.selected = file_idx;
+        let old_dir = app.current_dir.clone();
+        app.enter_dir();
+        assert_eq!(app.current_dir, old_dir);
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn enter_dir_empty_entries() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        app.entries.clear();
+        app.enter_dir(); // should not panic
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn enter_dir_parent_goes_up() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        // Navigate into alpha
+        let idx = app.entries.iter().position(|e| e.name == "alpha").unwrap();
+        app.selected = idx;
+        app.enter_dir();
+        assert_eq!(app.current_dir, tmp.join("alpha"));
+        // Now select ".." and enter
+        app.selected = 0; // ".." is always first
+        assert!(app.entries[0].is_parent);
+        app.enter_dir();
+        assert_eq!(app.current_dir, tmp);
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn go_up_with_history() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        let idx = app.entries.iter().position(|e| e.name == "alpha").unwrap();
+        app.selected = idx;
+        app.enter_dir();
+        app.go_up();
+        assert_eq!(app.current_dir, tmp);
+        assert_eq!(app.selected, idx); // restored from history
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn go_up_without_history() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        let parent = tmp.parent().unwrap().to_path_buf();
+        app.go_up();
+        assert_eq!(app.current_dir, parent);
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn navigate_to_clears_history() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        app.history.push((PathBuf::from("/old"), 0, 0));
+        app.navigate_to(tmp.join("alpha"));
+        assert_eq!(app.current_dir, tmp.join("alpha"));
+        assert!(app.history.is_empty());
+        assert_eq!(app.selected, 0);
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn navigate_to_same_dir_noop() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        app.history.push((PathBuf::from("/old"), 0, 0));
+        app.navigate_to(tmp.clone());
+        // History should not be cleared since we didn't actually navigate
+        assert_eq!(app.history.len(), 1);
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn set_directory_changes_dir() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        app.set_directory(tmp.join("beta"));
+        assert_eq!(app.current_dir, tmp.join("beta"));
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn move_selection_forward() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        app.selected = 0;
+        app.move_selection(2, 10);
+        assert_eq!(app.selected, 2);
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn move_selection_clamps_max() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        let len = app.entries.len();
+        app.move_selection(999, 10);
+        assert_eq!(app.selected, len - 1);
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn move_selection_backward() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        app.selected = 3;
+        app.move_selection(-2, 10);
+        assert_eq!(app.selected, 1);
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn move_selection_clamps_min() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        app.selected = 1;
+        app.move_selection(-999, 10);
+        assert_eq!(app.selected, 0);
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn move_selection_empty() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        app.entries.clear();
+        app.move_selection(1, 10); // should not panic
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn move_selection_scrolls_down() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        app.scroll = 0;
+        // Move past visible area (visible_rows=2)
+        app.move_selection(3, 2);
+        assert!(app.scroll > 0);
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn move_selection_scrolls_up() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        app.selected = 3;
+        app.scroll = 3;
+        app.move_selection(-2, 10);
+        assert_eq!(app.scroll, 1); // scroll follows selection
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn toggle_sort_switches_mode() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        assert!(app.sort_by_size.load(Ordering::Relaxed));
+        app.toggle_sort();
+        assert!(!app.sort_by_size.load(Ordering::Relaxed));
+        app.toggle_sort();
+        assert!(app.sort_by_size.load(Ordering::Relaxed));
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn delete_selected_returns_info() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        let idx = app.entries.iter().position(|e| e.name == "file_a.txt").unwrap();
+        app.selected = idx;
+        let result = app.delete_selected().unwrap();
+        assert_eq!(result.0, "file_a.txt");
+        assert!(!result.2); // not a dir
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn delete_selected_empty() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        app.entries.clear();
+        assert!(app.delete_selected().is_err());
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn execute_delete_file() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        let target = tmp.join("file_b.txt");
+        assert!(target.exists());
+        app.execute_delete(&target, false).unwrap();
+        assert!(!target.exists());
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn execute_delete_dir() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        let target = tmp.join("beta");
+        assert!(target.exists());
+        app.execute_delete(&target, true).unwrap();
+        assert!(!target.exists());
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn execute_delete_nonexistent() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        let result = app.execute_delete(Path::new("/nonexistent_path_xyz"), false);
+        assert!(result.is_err());
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn switch_drive_idle_no_scan() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        let new_root = tmp.join("alpha");
+        app.switch_drive_idle(new_root.clone());
+        assert_eq!(app.current_dir, new_root);
+        assert_eq!(app.scan_root, new_root);
+        assert!(app.history.is_empty());
+        assert!(!app.scan_state.is_scanning());
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn has_scanned_false_initially() {
+        let tmp = setup_test_dir();
+        let app = AppState::new_idle(&tmp);
+        assert!(!app.has_scanned());
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn scan_starts_scan() {
+        let tmp = setup_test_dir();
+        let mut app = AppState::new_idle(&tmp);
+        app.scan();
+        // Scan should start
+        // Wait a bit for it to register
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(app.has_scanned());
+        app.stop_scan();
+        cleanup(&tmp);
+    }
+
+    #[test]
+    fn sync_entry_source_matches_entries() {
+        let tmp = setup_test_dir();
+        let app = AppState::new_idle(&tmp);
+        let source = app.entry_source.lock().unwrap();
+        assert_eq!(source.len(), app.entries.len());
+        for (i, (name, path, is_dir, is_parent, _size)) in source.iter().enumerate() {
+            assert_eq!(name, &app.entries[i].name);
+            assert_eq!(path, &app.entries[i].path);
+            assert_eq!(*is_dir, app.entries[i].is_dir);
+            assert_eq!(*is_parent, app.entries[i].is_parent);
+        }
+        cleanup(&tmp);
+    }
+}

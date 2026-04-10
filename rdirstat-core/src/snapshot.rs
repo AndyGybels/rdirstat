@@ -148,3 +148,159 @@ pub fn spawn_snapshot_thread(
 
     rx
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn empty_snapshot() {
+        let snap = UiSnapshot::empty();
+        assert!(!snap.scanning);
+        assert_eq!(snap.files_scanned, 0);
+        assert_eq!(snap.dirs_scanned, 0);
+        assert_eq!(snap.total_bytes, 0);
+        assert!(snap.entries.is_empty());
+        assert_eq!(snap.total_entry_size, 0);
+        assert!(snap.top_files.is_empty());
+        assert!(snap.top_dirs.is_empty());
+        assert!(snap.top_exts.is_empty());
+        assert_eq!(snap.deepest.1, 0);
+        assert!(snap.scan_start.is_none());
+    }
+
+    #[test]
+    fn build_snapshot_empty_entries() {
+        let state = ScanState::new();
+        let entries: Vec<(String, PathBuf, bool, bool, u64)> = vec![];
+        let snap = build_snapshot(&state, &entries, true);
+        assert!(!snap.scanning);
+        assert!(snap.entries.is_empty());
+        assert_eq!(snap.total_entry_size, 0);
+    }
+
+    #[test]
+    fn build_snapshot_with_files() {
+        let state = ScanState::new();
+        let entries = vec![
+            ("b.txt".to_string(), PathBuf::from("/b.txt"), false, false, 200u64),
+            ("a.txt".to_string(), PathBuf::from("/a.txt"), false, false, 100u64),
+        ];
+        let snap = build_snapshot(&state, &entries, false);
+        assert_eq!(snap.entries.len(), 2);
+        assert_eq!(snap.total_entry_size, 300);
+        // Sorted by name
+        assert_eq!(snap.entries[0].name, "a.txt");
+        assert_eq!(snap.entries[1].name, "b.txt");
+    }
+
+    #[test]
+    fn build_snapshot_sort_by_size() {
+        let state = ScanState::new();
+        let entries = vec![
+            ("small.txt".to_string(), PathBuf::from("/small"), false, false, 10u64),
+            ("big.txt".to_string(), PathBuf::from("/big"), false, false, 1000u64),
+            ("mid.txt".to_string(), PathBuf::from("/mid"), false, false, 500u64),
+        ];
+        let snap = build_snapshot(&state, &entries, true);
+        assert_eq!(snap.entries[0].name, "big.txt");
+        assert_eq!(snap.entries[1].name, "mid.txt");
+        assert_eq!(snap.entries[2].name, "small.txt");
+    }
+
+    #[test]
+    fn build_snapshot_parent_always_first() {
+        let state = ScanState::new();
+        let entries = vec![
+            ("a.txt".to_string(), PathBuf::from("/a"), false, false, 9999u64),
+            ("..".to_string(), PathBuf::from("/parent"), true, true, 0u64),
+        ];
+        // Sort by size — parent should still be first despite having size 0
+        let snap = build_snapshot(&state, &entries, true);
+        assert_eq!(snap.entries[0].name, "..");
+        assert!(snap.entries[0].is_parent);
+    }
+
+    #[test]
+    fn build_snapshot_dir_uses_scan_size() {
+        let state = ScanState::new();
+        state.dir_sizes.lock().unwrap().insert(PathBuf::from("/sub"), 5000);
+        let entries = vec![
+            ("sub".to_string(), PathBuf::from("/sub"), true, false, 0u64),
+        ];
+        let snap = build_snapshot(&state, &entries, true);
+        assert_eq!(snap.entries[0].size, 5000);
+        assert_eq!(snap.total_entry_size, 5000);
+    }
+
+    #[test]
+    fn build_snapshot_scanning_state() {
+        let state = ScanState::new();
+        state.scanning.store(true, Ordering::Relaxed);
+        let entries = vec![
+            ("sub".to_string(), PathBuf::from("/sub"), true, false, 0u64),
+        ];
+        let snap = build_snapshot(&state, &entries, true);
+        assert!(snap.scanning);
+        assert!(snap.entries[0].scanning); // dir not completed while scanning
+    }
+
+    #[test]
+    fn build_snapshot_completed_dir_not_scanning() {
+        let state = ScanState::new();
+        state.scanning.store(true, Ordering::Relaxed);
+        state.completed.lock().unwrap().insert(PathBuf::from("/sub"));
+        let entries = vec![
+            ("sub".to_string(), PathBuf::from("/sub"), true, false, 0u64),
+        ];
+        let snap = build_snapshot(&state, &entries, true);
+        assert!(!snap.entries[0].scanning);
+    }
+
+    #[test]
+    fn build_snapshot_includes_top_files() {
+        let state = ScanState::new();
+        state.record_top_file(Path::new("/big"), 9999);
+        let snap = build_snapshot(&state, &[], true);
+        assert_eq!(snap.top_files.len(), 1);
+        assert_eq!(snap.top_files[0].size, 9999);
+    }
+
+    #[test]
+    fn build_snapshot_includes_deepest() {
+        let state = ScanState::new();
+        state.set_deepest_path(Path::new("/a/b/c/d"), 4);
+        let snap = build_snapshot(&state, &[], true);
+        assert_eq!(snap.deepest.1, 4);
+    }
+
+    #[test]
+    fn build_snapshot_includes_scan_start() {
+        let state = ScanState::new();
+        let now = std::time::Instant::now();
+        *state.scan_start.lock().unwrap() = Some(now);
+        let snap = build_snapshot(&state, &[], true);
+        assert!(snap.scan_start.is_some());
+    }
+
+    #[test]
+    fn spawn_snapshot_thread_produces_snapshots() {
+        let state = ScanState::new();
+        state.files_scanned.store(42, Ordering::Relaxed);
+        let entry_source = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sort_by_size = Arc::new(AtomicBool::new(true));
+
+        let rx = spawn_snapshot_thread(
+            Arc::clone(&state),
+            Arc::clone(&entry_source),
+            sort_by_size,
+        );
+
+        // Wait for at least one snapshot
+        let snap = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(snap.files_scanned, 42);
+        // Drop receiver to stop the thread
+    }
+}
