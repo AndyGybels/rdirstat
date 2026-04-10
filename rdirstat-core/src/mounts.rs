@@ -1,3 +1,5 @@
+#[cfg(not(target_os = "windows"))]
+use std::fs;
 use std::path::PathBuf;
 
 #[derive(Clone)]
