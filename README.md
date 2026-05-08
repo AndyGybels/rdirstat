@@ -4,19 +4,7 @@ A fast disk usage analyzer in the WinDirStat / KDirStat / `ncdu` family — writ
 in Rust, ships as both a terminal UI and a native desktop GUI from the same
 scanner core.
 
-```
-┌ rdirstat ────────────────────────────────────────────────────────────────────┐
-│ [Overview]  /  | 16 items | 860.2 GB total | sort: size                       │
-└──────────────────────────────────────────────────────────────────────────────┘
-┌ Overview ────────────────────────────────────────────────────────────────────┐
-│ Summary                                                                      │
-│  Status:      Complete                                                       │
-│  Scan root:   /                                                              │
-│  Total size:  860.2 GB                                                       │
-│  Files:       6 097 412                                                      │
-│  Directories: 1 218 540                                                      │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+![rdirstat GUI](assets/gui-main.png)
 
 ## Why
 
@@ -30,6 +18,15 @@ desktop GUI, without maintaining two scanners. rdirstat ships
 both — they share the exact same engine and snapshot pipeline; only the
 rendering layer differs.
 
+## Screenshots
+
+| GUI | TUI |
+|---|---|
+| ![GUI – explorer](assets/gui-main.png) | ![TUI – explorer](assets/tui-main.png) |
+| ![GUI – overview](assets/gui-overview.png) | ![TUI – overview](assets/tui-overview.png) |
+
+Both frontends share an Explorer view (entry list with size bars) and an
+Overview view (totals + biggest files / dirs / extensions).
 
 ## Install
 
