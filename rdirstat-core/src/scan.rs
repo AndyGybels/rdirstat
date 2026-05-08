@@ -893,7 +893,8 @@ mod tests {
     fn process_completions_empty() {
         let state = ScanState::new();
         let mut yielded = HashMap::new();
-        let result = state.process_completions(&mut yielded, Path::new("/root"));
+        let mut pending_expected: Vec<(PathBuf, usize)> = Vec::new();
+        let result = state.process_completions(&mut yielded, &mut pending_expected, Path::new("/root"));
         assert!(result.is_empty());
     }
 
@@ -908,7 +909,8 @@ mod tests {
         // Yield only 2
         let mut yielded = HashMap::new();
         yielded.insert(PathBuf::from("/root/a"), 2);
-        let result = state.process_completions(&mut yielded, Path::new("/root"));
+        let mut pending_expected: Vec<(PathBuf, usize)> = Vec::new();
+        let result = state.process_completions(&mut yielded, &mut pending_expected, Path::new("/root"));
         assert!(result.is_empty());
     }
 
@@ -921,7 +923,8 @@ mod tests {
         }
         let mut yielded = HashMap::new();
         yielded.insert(PathBuf::from("/root/a"), 3);
-        let result = state.process_completions(&mut yielded, Path::new("/root"));
+        let mut pending_expected: Vec<(PathBuf, usize)> = Vec::new();
+        let result = state.process_completions(&mut yielded, &mut pending_expected, Path::new("/root"));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], PathBuf::from("/root/a"));
     }
@@ -939,7 +942,8 @@ mod tests {
         // Yield 1 to /root/a/b → it completes → cascades +1 to /root/a → /root/a completes
         let mut yielded = HashMap::new();
         yielded.insert(PathBuf::from("/root/a/b"), 1);
-        let result = state.process_completions(&mut yielded, Path::new("/root"));
+        let mut pending_expected: Vec<(PathBuf, usize)> = Vec::new();
+        let result = state.process_completions(&mut yielded, &mut pending_expected, Path::new("/root"));
         assert!(result.contains(&PathBuf::from("/root/a/b")));
         assert!(result.contains(&PathBuf::from("/root/a")));
     }
@@ -953,7 +957,8 @@ mod tests {
         }
         let mut yielded = HashMap::new();
         yielded.insert(PathBuf::from("/root"), 1);
-        let result = state.process_completions(&mut yielded, Path::new("/root"));
+        let mut pending_expected: Vec<(PathBuf, usize)> = Vec::new();
+        let result = state.process_completions(&mut yielded, &mut pending_expected, Path::new("/root"));
         assert_eq!(result, vec![PathBuf::from("/root")]);
         // Should not cascade above root
     }
