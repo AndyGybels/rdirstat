@@ -401,6 +401,14 @@ impl eframe::App for GuiApp {
                 }
                 if ui.button("Delete (d)").clicked() { self.prompt_delete(); }
                 if ui.button("Drives (g)").clicked() { self.open_drive_picker(); }
+
+                // Right-aligned Quit — same exit path as the Q / Esc shortcut.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Quit (q)").clicked() {
+                        self.state.stop_scan();
+                        std::process::exit(0);
+                    }
+                });
             });
         });
 
