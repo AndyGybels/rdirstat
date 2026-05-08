@@ -1,3 +1,43 @@
+//! The parallel directory walker and the [`ScanState`] it writes into.
+//!
+//! [`start_scan`] spawns a background thread that drives the
+//! [`ignore::WalkBuilder`] parallel walker, accumulating per-directory sizes,
+//! top-N tracking (files / directories / extensions), and post-order
+//! completion into a shared [`ScanState`]. Frontends typically don't read
+//! [`ScanState`] directly during rendering — they go through the
+//! [`crate::snapshot`] pipeline instead — but it's exposed for tests and for
+//! advanced callers that want raw access.
+//!
+//! ## Correctness invariants
+//!
+//! These are the things this module is opinionated about:
+//!
+//! - **Allocated size.** Per-file size is recorded via
+//!   [`crate::util::allocated_size`], i.e. `m.blocks() * 512` on Unix.
+//! - **Inode deduplication.** Files seen at multiple paths (hardlinks, macOS
+//!   firmlinks) are counted once. The shared seen-inode set is sharded
+//!   across 64 mutex-protected `HashSet`s to spread lock contention across
+//!   walker threads.
+//! - **Real post-order completion.** A directory `D` is added to
+//!   [`ScanState::completed`] only when every file in its subtree has
+//!   been counted — not when its immediate children are first listed. See
+//!   the [`completion`](#completion-tracking) section below.
+//!
+//! ## Completion tracking
+//!
+//! For each directory `D` we maintain `(yielded[D], expected[D])`, where:
+//!
+//! - `expected[D]` is set by `read_dir(D).count()` when the walker first
+//!   yields `D`.
+//! - `yielded[D]` is incremented by 1 each time a file/symlink child of `D`
+//!   is yielded by the walker, and by 1 each time a subdirectory child of
+//!   `D` recursively *completes* (cascading up the tree).
+//!
+//! When `yielded[D] == expected[D]`, `D` is complete: every file has been
+//! counted *and* every subdirectory has been recursively finished. This is
+//! distinct from "the walker has finished listing D's immediate children",
+//! which is a much weaker condition.
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -9,22 +49,37 @@ use ignore::WalkBuilder;
 use crate::logging::log;
 use crate::util::{allocated_size, strip_unc_prefix};
 
-/// A tracked large file or directory.
+/// A path with its associated size — the unit returned by top-N tracking
+/// for both files ([`ScanState::top_files`]) and directories
+/// ([`ScanState::top_dirs`]).
 #[derive(Clone)]
 pub struct SizedEntry {
+    /// Absolute path to the entry.
     pub path: PathBuf,
+    /// Size in bytes (allocated, on Unix; logical, elsewhere).
     pub size: u64,
 }
 
-/// Per-extension statistics.
+/// Aggregated stats for a single file extension across the whole scan.
+///
+/// Produced by [`ScanState::refresh_top_exts`] and exposed through
+/// [`crate::snapshot::UiSnapshot::top_exts`] for "biggest file types" views.
 #[derive(Clone)]
 pub struct ExtensionStat {
+    /// The lower-cased extension, without the leading dot (e.g. `"jpg"`).
     pub extension: String,
+    /// Number of files seen with this extension.
     pub count: u64,
+    /// Sum of allocated sizes across those files.
     pub total_size: u64,
 }
 
-/// Shared state between the background scanner and the UI.
+/// Live state shared between the background scanner and the UI.
+///
+/// All fields are interior-mutable (atomics or `Mutex`) so the scanner can
+/// write while the snapshot thread reads. Wrap in `Arc` and clone freely;
+/// the [`start_scan`] entry point and the [`crate::snapshot`] pipeline both
+/// expect `Arc<ScanState>`.
 pub struct ScanState {
     /// Accumulated size per directory (updated live during scan).
     pub dir_sizes: Mutex<HashMap<PathBuf, u64>>,
@@ -76,6 +131,9 @@ const FLUSH_INTERVAL: u64 = 5000;
 const INODE_SHARDS: usize = 64;
 
 impl ScanState {
+    /// Construct a fresh, empty scan state ready to be passed to
+    /// [`start_scan`]. Returned wrapped in `Arc` because every consumer
+    /// (walker thread, snapshot thread, UI) holds a clone.
     pub fn new() -> Arc<Self> {
         Arc::new(ScanState {
             dir_sizes: Mutex::new(HashMap::with_capacity(100_000)),
@@ -116,23 +174,32 @@ impl ScanState {
         }
     }
 
+    /// Current accumulated size for a directory, or `None` if it hasn't
+    /// been seen yet. Updated live during the scan.
     pub fn get_size(&self, path: &Path) -> Option<u64> {
         self.dir_sizes.lock().unwrap().get(path).copied()
     }
 
+    /// Whether `path` has been recursively finished — every file in its
+    /// subtree has been counted. False during an in-progress scan even
+    /// when the walker has already listed `path`'s immediate children.
     pub fn is_completed(&self, path: &Path) -> bool {
         self.completed.lock().unwrap().contains(path)
     }
 
+    /// Whether a scan is currently running.
     pub fn is_scanning(&self) -> bool {
         self.scanning.load(Ordering::Relaxed)
     }
 
+    /// Total number of unique files counted so far (after inode dedup).
     pub fn files_scanned(&self) -> u64 {
         self.files_scanned.load(Ordering::Relaxed)
     }
 
-    /// Track a file for top-N. Only locks if the file is big enough.
+    /// Maintain the running top-N biggest files. Cheap fast-path
+    /// (`size <= min` check via an atomic) avoids a lock for the common
+    /// case of small files that wouldn't make the cut.
     pub fn record_top_file(&self, path: &Path, size: u64) {
         let min = self.top_files_min.load(Ordering::Relaxed);
         if size <= min {
@@ -152,6 +219,8 @@ impl ScanState {
         }
     }
 
+    /// Increment the directory counter and update the running deepest-depth
+    /// record. Cheap — uses a CAS loop, no `Mutex` acquisition.
     pub fn record_dir(&self, depth: usize) {
         self.dirs_scanned.fetch_add(1, Ordering::Relaxed);
         loop {
@@ -167,6 +236,10 @@ impl ScanState {
         }
     }
 
+    /// Record the actual deepest path. Called only when a thread observes
+    /// a depth strictly greater than the current record (the cheap atomic
+    /// gate is in [`Self::record_dir`]), so the lock here is rarely
+    /// contended.
     pub fn set_deepest_path(&self, path: &Path, depth: usize) {
         let mut deepest = self.deepest_path.lock().unwrap();
         if depth > deepest.1 {
@@ -174,7 +247,13 @@ impl ScanState {
         }
     }
 
-    /// Update top dirs when a directory is completed with its final size.
+    /// Maintain the running top-N biggest directories.
+    ///
+    /// Updates an existing entry in place if `path` is already tracked,
+    /// otherwise inserts. Designed to be called both during the scan (with
+    /// partial sizes — the entry will be updated when the directory is
+    /// truly complete) and from the end-of-scan finalization pass (with
+    /// final sizes for every directory in [`Self::dir_sizes`]).
     pub fn record_completed_dir(&self, path: &Path, size: u64) {
         let min = self.top_dirs_min.load(Ordering::Relaxed);
         if size <= min {
@@ -197,7 +276,9 @@ impl ScanState {
         self.top_dirs_min.store(new_min, Ordering::Relaxed);
     }
 
-    /// Merge thread-local extension stats into the shared map.
+    /// Merge a walker thread's local per-extension `(count, total_size)`
+    /// map into the shared aggregate. Called from the walker on flush —
+    /// keeps lock acquisitions on `ext_stats` infrequent.
     pub fn merge_ext_stats(&self, local: &HashMap<String, (u64, u64)>) {
         let mut stats = self.ext_stats.lock().unwrap();
         for (ext, (count, size)) in local {
@@ -207,7 +288,10 @@ impl ScanState {
         }
     }
 
-    /// Rebuild the cached top extensions list from ext_stats.
+    /// Recompute [`Self::top_exts_cache`] — the top-N extensions by total
+    /// size — from the running `ext_stats` aggregate. Called periodically
+    /// by the scanner (snapshots read the cache, not `ext_stats` directly,
+    /// to keep snapshot-build cheap).
     pub fn refresh_top_exts(&self, n: usize) {
         let stats = self.ext_stats.lock().unwrap();
         let mut exts: Vec<ExtensionStat> = stats.iter()
@@ -223,6 +307,10 @@ impl ScanState {
         *self.top_exts_cache.lock().unwrap() = exts;
     }
 
+    /// Reset every field to its initial state — totals, top-N lists, the
+    /// per-directory completion map, the seen-inode shards, and the cancel
+    /// flag's downstream effects. Use this before [`start_scan`] when
+    /// re-scanning the same `ScanState`.
     pub fn clear(&self) {
         self.dir_sizes.lock().unwrap().clear();
         self.completed.lock().unwrap().clear();
@@ -526,7 +614,34 @@ impl Drop for ThreadLocalState {
     }
 }
 
-/// Start the background scanner using the `ignore` crate's parallel walker.
+/// Spawn the background scanner thread.
+///
+/// Returns immediately; the walk runs on its own thread and updates `state`
+/// in place. Progress is observable via [`ScanState::is_scanning`],
+/// [`ScanState::files_scanned`], [`ScanState::total_bytes`], and the
+/// per-directory views (`dir_sizes`, `completed`, `top_files`, `top_dirs`,
+/// `top_exts_cache`). To stop early, set `state.cancel = true` — the walker
+/// checks this between entries.
+///
+/// The walker uses `num_cpus::get().max(2)` worker threads. `state` is
+/// expected to be freshly constructed via [`ScanState::new`] or
+/// [`ScanState::clear`]-ed; running [`start_scan`] on a state with
+/// pre-existing data will produce nonsense.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::path::PathBuf;
+/// use std::sync::Arc;
+/// use rdirstat_core::{ScanState, start_scan};
+///
+/// let state = ScanState::new();
+/// start_scan(PathBuf::from("."), Arc::clone(&state));
+///
+/// while state.is_scanning() {
+///     std::thread::sleep(std::time::Duration::from_millis(50));
+/// }
+/// ```
 pub fn start_scan(root: PathBuf, state: Arc<ScanState>) {
     state.cancel.store(false, Ordering::Relaxed);
     *state.scan_start.lock().unwrap() = Some(std::time::Instant::now());

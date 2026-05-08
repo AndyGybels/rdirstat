@@ -2,12 +2,16 @@
 name = "rdirstat-gui"
 version = "0.1.0"
 edition = "2021"
-description = "A fast disk space analyzer (GUI)"
+description = "A fast disk space analyzer (GUI) — parallel scanner with live snapshot updates, built on egui"
 license = "MIT"
 repository = "https://github.com/AndyGybels/rdirstat"
+homepage = "https://github.com/AndyGybels/rdirstat"
+readme = "../README.md"
+categories = ["filesystem", "visualization", "gui"]
+keywords = ["disk-usage", "ncdu", "du", "egui", "filesystem"]
 
 [dependencies]
-rdirstat-core = { path = "../rdirstat-core" }
+rdirstat-core = { path = "../rdirstat-core", version = "0.1.0" }
 eframe = "0.31"
 egui_extras = "0.31"
 

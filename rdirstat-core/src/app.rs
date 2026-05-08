@@ -1,3 +1,13 @@
+//! [`AppState`] — the controller layer between a frontend and the scan
+//! engine.
+//!
+//! Owns the current directory, the scan state, the navigation history,
+//! sort preference, and the shared entry buffer the snapshot thread reads
+//! from. Frontends call methods like [`AppState::set_directory`],
+//! [`AppState::scan`], [`AppState::stop_scan`], [`AppState::toggle_sort`],
+//! and [`AppState::execute_delete`]; they don't manipulate the underlying
+//! [`ScanState`] directly.
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -8,6 +18,11 @@ use crate::model::DirEntry;
 use crate::scan::{start_scan, ScanState};
 use crate::util::{allocated_size, strip_unc_prefix};
 
+/// Top-level controller state for an `rdirstat` frontend.
+///
+/// Two construction modes — see [`AppState::new`] (auto-scans on
+/// construction, used by the TUI) and [`AppState::new_idle`] (no scan
+/// until the user triggers one, used by the GUI).
 pub struct AppState {
     pub current_dir: PathBuf,
     pub scan_root: PathBuf,
@@ -23,6 +38,8 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Construct an `AppState` and immediately start scanning `root`.
+    /// Used by frontends that scan-on-launch (e.g. the TUI).
     pub fn new(root: &Path) -> Self {
         let scan_state = ScanState::new();
         start_scan(root.to_path_buf(), Arc::clone(&scan_state));

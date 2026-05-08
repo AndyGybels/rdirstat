@@ -1,3 +1,12 @@
+//! Append-only file logger used by the `rdirstat` and `rdirstat-gui`
+//! binaries.
+//!
+//! Writes time-stamped lines to `./rdirstat.log` in the current working
+//! directory. Library callers shouldn't normally use this — it's hard-coded
+//! to a relative path and aimed at the binaries' diagnostics. Build your
+//! own `tracing` subscriber if you're embedding `rdirstat-core` in a larger
+//! application.
+
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::fs;
@@ -30,10 +39,17 @@ impl Logger {
 
 static mut LOGGER: Option<Arc<Logger>> = None;
 
+/// Initialise the global file logger. Opens `rdirstat.log` (creating it if
+/// needed) and writes a `--- session start ---` marker. Subsequent
+/// [`log`] calls write through this handle. Calling this multiple times
+/// rotates the underlying file handle but doesn't truncate.
 pub fn init_logger() {
     unsafe { LOGGER = Some(Logger::init()) }
 }
 
+/// Append a time-stamped line to the log file, if [`init_logger`] has been
+/// called. No-op otherwise — safe to call from libraries that don't know
+/// whether the host has set up logging.
 pub fn log(msg: &str) {
     unsafe {
         if let Some(ref logger) = LOGGER {

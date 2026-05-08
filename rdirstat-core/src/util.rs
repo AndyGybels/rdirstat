@@ -1,3 +1,7 @@
+//! Small free-standing helpers shared across the crate: allocated-size
+//! accounting, Windows UNC-path normalisation, and human-friendly byte
+//! formatting.
+
 use std::fs::Metadata;
 use std::path::PathBuf;
 
@@ -23,6 +27,13 @@ pub fn allocated_size(metadata: &Metadata) -> u64 {
     }
 }
 
+/// Strip the `\\?\` Windows UNC long-path prefix.
+///
+/// `std::fs::canonicalize` and the `ignore` walker emit paths like
+/// `\\?\C:\Users\...` on Windows. The prefix is meaningful to the kernel
+/// (it disables MAX_PATH limits) but ugly in UI display, and breaks
+/// path-equality checks elsewhere in the code that don't go through
+/// canonicalize. This helper removes it; on non-Windows paths it's a no-op.
 pub fn strip_unc_prefix(path: PathBuf) -> PathBuf {
     let s = path.to_string_lossy();
     if let Some(stripped) = s.strip_prefix(r"\\?\") {
@@ -32,6 +43,19 @@ pub fn strip_unc_prefix(path: PathBuf) -> PathBuf {
     }
 }
 
+/// Format a byte count for display: `1024` → `"1.0 KB"`, `0` → `"0 B"`,
+/// etc. Uses 1024-based ("binary") prefixes — matches what `du -h`,
+/// `ls -lh`, and most disk-usage tools show.
+///
+/// # Examples
+///
+/// ```
+/// use rdirstat_core::format_size;
+///
+/// assert_eq!(format_size(0), "0 B");
+/// assert_eq!(format_size(1024), "1.0 KB");
+/// assert_eq!(format_size(1024 * 1024 * 5 + 1024 * 512), "5.5 MB");
+/// ```
 pub fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;

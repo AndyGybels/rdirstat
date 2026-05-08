@@ -1,37 +1,76 @@
+//! Lock-free, clone-on-tick view of the live [`ScanState`] for the UI.
+//!
+//! Frontends never read [`ScanState`] directly during rendering. Instead a
+//! background thread (see [`spawn_snapshot_thread`]) polls the live state
+//! every 100 ms, builds a [`UiSnapshot`], and pushes it through an
+//! `mpsc::Sender`. The UI's event loop drains the channel each frame and
+//! renders off the latest snapshot — no scanner-locks held during draw,
+//! no jitter as the walker grows the data structures behind it.
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::scan::{ExtensionStat, ScanState, SizedEntry};
 
-/// A resolved view of one directory entry for the UI.
+/// One resolved row in a directory listing, suitable for direct rendering.
+///
+/// Built by [`build_snapshot`] from the entries the frontend wants to show.
+/// The `..` parent-nav row uses `is_parent = true`, in which case `size`
+/// is forced to 0 (it's a navigation affordance, not a real member of the
+/// current directory).
 #[derive(Clone)]
 pub struct EntrySnapshot {
+    /// Display name (e.g. `"src"`, `".."`).
     pub name: String,
+    /// Absolute path. For `is_parent` entries this is the parent directory.
     pub path: PathBuf,
     pub is_dir: bool,
+    /// True if this is the synthetic `..` parent-nav entry.
     pub is_parent: bool,
+    /// Size in bytes. Always 0 for parent-nav entries.
     pub size: u64,
+    /// Whether this directory is still being walked. Always false for files
+    /// and for `is_parent` entries.
     pub scanning: bool,
 }
 
-/// Everything the UI needs for one frame, produced off the UI thread.
+/// Everything the UI needs to render one frame.
+///
+/// `Clone` is cheap-ish (a few `Vec`s and `String`s) — the snapshot thread
+/// produces a fresh one every 100 ms and pushes it through a channel.
 #[derive(Clone)]
 pub struct UiSnapshot {
+    /// Whether the scan is currently in progress.
     pub scanning: bool,
+    /// Total unique files counted (after inode dedup).
     pub files_scanned: u64,
+    /// Total directories visited.
     pub dirs_scanned: u64,
+    /// Total bytes counted across all unique files.
     pub total_bytes: u64,
+    /// The current directory's listing, sorted as the UI requested.
     pub entries: Vec<EntrySnapshot>,
+    /// Sum of `entries[i].size` across non-parent rows. Excludes `..`'s
+    /// (zeroed) size, so this is the *current directory*'s total — never
+    /// inflated by the parent.
     pub total_entry_size: u64,
+    /// Running top-N biggest files in the whole subtree.
     pub top_files: Vec<SizedEntry>,
+    /// Running top-N biggest directories.
     pub top_dirs: Vec<SizedEntry>,
+    /// Top-N extensions by total size.
     pub top_exts: Vec<ExtensionStat>,
+    /// `(path, depth)` of the deepest directory encountered so far.
     pub deepest: (PathBuf, usize),
+    /// When the current scan started (for elapsed-time / rate displays).
     pub scan_start: Option<std::time::Instant>,
 }
 
 impl UiSnapshot {
+    /// A snapshot with all counters at 0 and all lists empty. Useful as an
+    /// initial value for the UI before the snapshot thread has produced
+    /// anything.
     pub fn empty() -> Self {
         UiSnapshot {
             scanning: false,
@@ -49,8 +88,15 @@ impl UiSnapshot {
     }
 }
 
-/// Build a snapshot from the current scan state and entry list.
-/// Uses targeted lookups — only reads the data it needs, never clones entire maps.
+/// Build a [`UiSnapshot`] from the current scan state and the directory
+/// listing the frontend wants to show.
+///
+/// `entries` is the frontend's pre-built list of rows
+/// `(name, path, is_dir, is_parent, file_size)` — the function only locks
+/// the [`ScanState`] briefly to look up directory sizes and the
+/// `completed` set, then drops the locks before sorting and assembling the
+/// snapshot. Sort by size if `sort_by_size`, otherwise by name; the
+/// parent-nav row is always pinned to the top regardless.
 pub fn build_snapshot(
     scan: &ScanState,
     entries: &[(String, PathBuf, bool, bool, u64)], // (name, path, is_dir, is_parent, file_size)
@@ -131,8 +177,20 @@ pub fn build_snapshot(
     }
 }
 
-/// Spawn a background thread that periodically builds snapshots and sends
-/// them through a channel. The UI thread calls `try_recv()` to get the latest.
+/// Spawn the snapshot thread.
+///
+/// Every 100 ms the thread:
+///
+/// 1. Reads the current entry list from `entry_source` (frontend updates
+///    this whenever the user navigates).
+/// 2. Reads the sort preference atomic.
+/// 3. Calls [`build_snapshot`] and pushes the result through the returned
+///    `Receiver`.
+/// 4. Exits when the receiver has been dropped.
+///
+/// The UI's event loop should `try_recv` (non-blocking) on each frame and
+/// keep the latest [`UiSnapshot`]. Don't `recv` (blocking) — that defeats
+/// the whole architecture.
 pub fn spawn_snapshot_thread(
     scan_state: Arc<ScanState>,
     entry_source: Arc<std::sync::Mutex<Vec<(String, PathBuf, bool, bool, u64)>>>,

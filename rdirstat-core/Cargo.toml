@@ -2,8 +2,14 @@
 name = "rdirstat-core"
 version = "0.1.0"
 edition = "2021"
-description = "Core library for rdirstat disk space analyzer"
+description = "Parallel directory scanner and snapshot pipeline behind the rdirstat TUI/GUI"
 license = "MIT"
+repository = "https://github.com/AndyGybels/rdirstat"
+homepage = "https://github.com/AndyGybels/rdirstat"
+documentation = "https://docs.rs/rdirstat-core"
+readme = "../README.md"
+categories = ["filesystem", "concurrency"]
+keywords = ["disk-usage", "filesystem", "directory", "scanner", "ncdu"]
 
 [dependencies]
 chrono = "0.4"

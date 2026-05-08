@@ -1,14 +1,30 @@
+//! Cross-platform drive / mount-point enumeration for "pick a disk to scan"
+//! UIs.
+//!
+//! Implementation differs per OS: drive letters on Windows, `/Volumes`
+//! entries on macOS, and parsed `/proc/mounts` on Linux. The returned list
+//! is intended for human selection, not as an authoritative filesystem
+//! mount table.
+
 #[cfg(not(target_os = "windows"))]
 use std::fs;
 use std::path::PathBuf;
 
+/// One drive or mount point that the user might want to scan.
 #[derive(Clone)]
 pub struct MountPoint {
+    /// Path to mount onto when selected (e.g. `/`, `/Volumes/External`,
+    /// `C:\`).
     pub path: PathBuf,
+    /// Human-friendly label for display in the UI.
     pub label: String,
 }
 
-/// List available drives/mount points for the current platform.
+/// Enumerate the user-visible drives / mount points on this machine.
+///
+/// Always returns at least `/` (Unix) or each present drive letter
+/// (Windows). The exact set depends on the platform, current mounts, and
+/// permissions.
 pub fn list_mounts() -> Vec<MountPoint> {
     #[cfg(target_os = "windows")]
     {

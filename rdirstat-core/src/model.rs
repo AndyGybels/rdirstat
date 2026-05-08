@@ -1,15 +1,35 @@
+//! The [`DirEntry`] row type used by [`crate::AppState`] to represent a
+//! single line in a directory listing.
+
 use std::path::PathBuf;
 use crate::scan::ScanState;
 
+/// One row in a directory listing.
+///
+/// Includes file size for files (frozen at the time the listing was built)
+/// but *not* directory size — directory sizes change as the scan
+/// progresses, so they're looked up live via [`Self::current_size`] against
+/// a [`ScanState`].
 pub struct DirEntry {
+    /// Display name. `".."` for the parent-nav row.
     pub name: String,
+    /// Absolute path. For parent-nav rows this is the parent directory.
     pub path: PathBuf,
     pub is_dir: bool,
+    /// For files: the file's allocated size in bytes. For directories:
+    /// always 0 — call [`Self::current_size`] for live values.
     pub file_size: u64,
+    /// True for the synthetic `..` parent-nav row.
     pub is_parent: bool,
 }
 
 impl DirEntry {
+    /// Current size to display, as of the moment of the call.
+    ///
+    /// - Parent-nav rows always return 0 (they're navigation, not content).
+    /// - Files return their frozen [`Self::file_size`].
+    /// - Directories look up the live accumulated size from `scan`, or 0
+    ///   if the scanner hasn't visited them yet.
     pub fn current_size(&self, scan: &ScanState) -> u64 {
         // The ".." parent-nav entry has `path = <parent>`, so a naive size
         // lookup returns the entire parent directory's size and double-counts
@@ -24,6 +44,9 @@ impl DirEntry {
         }
     }
 
+    /// Whether this entry is currently being scanned — only ever true for
+    /// directories whose subtree hasn't yet been recursively completed.
+    /// Files and the parent-nav row always return false.
     pub fn is_scanning(&self, scan: &ScanState) -> bool {
         if !self.is_dir {
             return false;

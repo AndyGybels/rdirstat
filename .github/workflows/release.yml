@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   build:
+    name: build (${{ matrix.target }})
     strategy:
       matrix:
         include:
@@ -93,6 +94,7 @@ jobs:
           path: dist/rdirstat-setup-x86_64.exe
 
   deb:
+    name: deb (${{ matrix.arch }})
     strategy:
       matrix:
         include:
@@ -136,6 +138,7 @@ jobs:
           path: dist/*.deb
 
   rpm:
+    name: rpm (${{ matrix.arch }})
     # Mirrors the `deb` job: both architectures are built on native runners
     # (no QEMU / cross-compile). cargo-generate-rpm reads the
     # `[package.metadata.generate-rpm]` section we added to each Cargo.toml
