@@ -1,3 +1,5 @@
+mod theme;
+
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -6,7 +8,7 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame, Terminal,
@@ -391,15 +393,13 @@ fn draw_ui(f: &mut Frame, app: &TuiApp) -> usize {
                 Line::from(""),
                 Line::from(vec![Span::styled(
                     format!("  Delete {kind}: {name}"),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
+                    theme::bold(),
                 )]),
                 Line::from(format!("  Size: {}", format_size(*size))),
                 Line::from(""),
                 Line::from(vec![Span::styled(
                     "  This action cannot be undone!",
-                    Style::default().fg(Color::Red),
+                    theme::warn(),
                 )]),
                 Line::from(""),
                 Line::from("  [y] Yes, delete    [n] Cancel"),
@@ -410,20 +410,17 @@ fn draw_ui(f: &mut Frame, app: &TuiApp) -> usize {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(" Confirm Delete ")
-                    .style(Style::default().fg(Color::Red)),
+                    .style(theme::warn()),
             );
             let area = centered_rect(50, height, f.area());
             f.render_widget(ratatui::widgets::Clear, area);
             f.render_widget(dialog, area);
         }
         Dialog::DeleteResult { message, success } => {
-            let color = if *success { Color::Green } else { Color::Red };
+            let style = if *success { theme::done() } else { theme::warn() };
             let lines = vec![
                 Line::from(""),
-                Line::from(vec![Span::styled(
-                    format!("  {message}"),
-                    Style::default().fg(color),
-                )]),
+                Line::from(vec![Span::styled(format!("  {message}"), style)]),
                 Line::from(""),
                 Line::from("  Press any key to continue"),
                 Line::from(""),
@@ -433,7 +430,7 @@ fn draw_ui(f: &mut Frame, app: &TuiApp) -> usize {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(" Result ")
-                    .style(Style::default().fg(color)),
+                    .style(style),
             );
             let area = centered_rect(50, height, f.area());
             f.render_widget(ratatui::widgets::Clear, area);
@@ -444,12 +441,9 @@ fn draw_ui(f: &mut Frame, app: &TuiApp) -> usize {
             for (i, mount) in mounts.iter().enumerate() {
                 let marker = if i == *selected { "> " } else { "  " };
                 let style = if i == *selected {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
+                    theme::selection()
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default()
                 };
                 lines.push(Line::from(vec![Span::styled(
                     format!("{marker}{}", mount.label),
@@ -459,7 +453,7 @@ fn draw_ui(f: &mut Frame, app: &TuiApp) -> usize {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![Span::styled(
                 "  j/k:Navigate  Enter:Select  Esc:Cancel",
-                Style::default().fg(Color::DarkGray),
+                theme::muted(),
             )]));
             lines.push(Line::from(""));
 
@@ -468,7 +462,7 @@ fn draw_ui(f: &mut Frame, app: &TuiApp) -> usize {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(" Select Drive ")
-                    .style(Style::default().fg(Color::Cyan)),
+                    .style(theme::heading()),
             );
             let area = centered_rect(40, height, f.area());
             f.render_widget(ratatui::widgets::Clear, area);
@@ -525,7 +519,7 @@ fn draw_header(f: &mut Frame, app: &TuiApp, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .title(" rdirstat ")
-            .style(Style::default().fg(Color::Cyan)),
+            .style(theme::heading()),
     );
     f.render_widget(header, area);
 }
@@ -540,7 +534,7 @@ fn draw_file_list(f: &mut Frame, app: &TuiApp, area: Rect) -> usize {
         let empty = Paragraph::new("  (empty directory)").block(
             Block::default()
                 .borders(Borders::ALL)
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(theme::muted()),
         );
         f.render_widget(empty, area);
         return inner_height;
@@ -589,21 +583,20 @@ fn draw_file_list(f: &mut Frame, app: &TuiApp, area: Rect) -> usize {
             let line_text =
                 format!("{icon}{display_name}{status} {size_str} {pct_str} {bar}");
 
-            let color = if entry.scanning {
-                Color::Yellow
+            // Per-row foreground role colour. The selection bar background
+            // is kept neutral so this fg stays distinguishable.
+            let fg = if entry.scanning {
+                theme::ACCENT_SCAN
             } else if entry.is_dir {
-                Color::Blue
+                theme::ACCENT_DIR
             } else {
-                Color::White
+                theme::ACCENT_FILE
             };
 
             let style = if is_selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(if entry.scanning { Color::Yellow } else { Color::Cyan })
-                    .add_modifier(Modifier::BOLD)
+                theme::selection().fg(fg)
             } else {
-                Style::default().fg(color)
+                Style::default().fg(fg)
             };
 
             Line::from(vec![Span::styled(line_text, style)])
@@ -626,7 +619,7 @@ fn draw_overview(f: &mut Frame, app: &TuiApp, area: Rect) -> usize {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Overview ")
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(theme::muted()),
         );
         f.render_widget(msg, area);
         return inner_height;
@@ -636,14 +629,14 @@ fn draw_overview(f: &mut Frame, app: &TuiApp, area: Rect) -> usize {
 
     // ── Summary ──
     let status = if snap.scanning { "Scanning..." } else { "Complete" };
-    let status_color = if snap.scanning { Color::Yellow } else { Color::Green };
+    let status_style = if snap.scanning { theme::scanning() } else { theme::done() };
 
     lines.push(Line::from(vec![
-        Span::styled(" Summary", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(" Summary", theme::heading()),
     ]));
     lines.push(Line::from(vec![
         Span::raw("  Status:      "),
-        Span::styled(status, Style::default().fg(status_color)),
+        Span::styled(status, status_style),
     ]));
     lines.push(Line::from(format!("  Scan root:   {}", app.state.scan_root.display())));
     lines.push(Line::from(vec![
@@ -666,7 +659,7 @@ fn draw_overview(f: &mut Frame, app: &TuiApp, area: Rect) -> usize {
 
     // ── Biggest Files ──
     lines.push(Line::from(vec![
-        Span::styled(" Biggest Files", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(" Biggest Files", theme::heading()),
     ]));
     if snap.top_files.is_empty() {
         lines.push(Line::from("  No files scanned yet."));
@@ -682,7 +675,7 @@ fn draw_overview(f: &mut Frame, app: &TuiApp, area: Rect) -> usize {
                 name
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:>9}", format_size(file.size)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  {:>9}", format_size(file.size)), theme::bold()),
                 Span::raw(format!("  {truncated}")),
             ]));
         }
@@ -691,7 +684,7 @@ fn draw_overview(f: &mut Frame, app: &TuiApp, area: Rect) -> usize {
 
     // ── Biggest Directories ──
     lines.push(Line::from(vec![
-        Span::styled(" Biggest Directories", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(" Biggest Directories", theme::heading()),
     ]));
     if snap.top_dirs.is_empty() {
         lines.push(Line::from("  No directories scanned yet."));
@@ -707,7 +700,7 @@ fn draw_overview(f: &mut Frame, app: &TuiApp, area: Rect) -> usize {
                 name
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:>9}", format_size(dir.size)), Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  {:>9}", format_size(dir.size)), theme::dir().add_modifier(Modifier::BOLD)),
                 Span::raw(format!("  {truncated}")),
             ]));
         }
@@ -716,7 +709,7 @@ fn draw_overview(f: &mut Frame, app: &TuiApp, area: Rect) -> usize {
 
     // ── Biggest File Types ──
     lines.push(Line::from(vec![
-        Span::styled(" Biggest File Types", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(" Biggest File Types", theme::heading()),
     ]));
     if snap.top_exts.is_empty() {
         lines.push(Line::from("  No file type data yet."));
@@ -724,7 +717,7 @@ fn draw_overview(f: &mut Frame, app: &TuiApp, area: Rect) -> usize {
         let max_ext_size = snap.top_exts.first().map(|e| e.total_size).unwrap_or(1).max(1);
         // Header
         lines.push(Line::from(vec![
-            Span::styled(format!("  {:<8} {:>7} {:>9}  ", "Ext", "Files", "Size"), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("  {:<8} {:>7} {:>9}  ", "Ext", "Files", "Size"), theme::muted()),
         ]));
         for ext in &snap.top_exts {
             let bar_max = col_width.saturating_sub(32).min(30);
@@ -734,9 +727,9 @@ fn draw_overview(f: &mut Frame, app: &TuiApp, area: Rect) -> usize {
                 + &"\u{2591}".repeat(bar_max.saturating_sub(bar_fill));
             lines.push(Line::from(vec![
                 Span::raw(format!("  .{:<7} {:>7} ", ext.extension, ext.count)),
-                Span::styled(format!("{:>9}", format_size(ext.total_size)), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{:>9}", format_size(ext.total_size)), theme::bold()),
                 Span::raw("  "),
-                Span::styled(bar, Style::default().fg(Color::Cyan)),
+                Span::styled(bar, Style::default().fg(theme::ACCENT_HEADING)),
             ]));
         }
     }
@@ -769,7 +762,7 @@ fn draw_help(f: &mut Frame, app: &TuiApp, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(theme::muted()),
         );
     f.render_widget(help, area);
 }

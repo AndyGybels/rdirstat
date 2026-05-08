@@ -1,5 +1,7 @@
 #![windows_subsystem = "windows"]
 
+mod theme;
+
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use std::sync::mpsc::Receiver;
@@ -28,7 +30,10 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "rdirstat",
         options,
-        Box::new(move |_cc| Ok(Box::new(GuiApp::new(&root)))),
+        Box::new(move |cc| {
+            theme::apply(&cc.egui_ctx);
+            Ok(Box::new(GuiApp::new(&root)))
+        }),
     )
 }
 
@@ -212,11 +217,21 @@ impl eframe::App for GuiApp {
         let has_dialog = !matches!(self.dialog, GuiDialog::None);
 
         if !has_dialog {
-            ctx.input(|i| {
-                if i.key_pressed(egui::Key::Q) || i.key_pressed(egui::Key::Escape) {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+            let want_quit = ctx.input(|i| {
+                i.key_pressed(egui::Key::Q) || i.key_pressed(egui::Key::Escape)
             });
+            if want_quit {
+                // Signal the walker to stop so it doesn't keep doing I/O for
+                // the few ms between our exit and the OS reaping the process.
+                self.state.stop_scan();
+                // ViewportCommand::Close on the root viewport stalls on macOS:
+                // eframe waits for the OS close handshake while wgpu/Metal is
+                // still draining frames AND the background scan thread is
+                // holding file handles open, producing the "Q locks up" symptom.
+                // The TUI just `break`s out and lets the OS reap everything,
+                // which is what we want here too. There's no persisted state.
+                std::process::exit(0);
+            }
         }
 
         enum KeyAction {
@@ -438,17 +453,17 @@ impl GuiApp {
                         let pct = entry.size as f64 / total_size as f64;
 
                         let text_color = if entry.is_parent {
-                            egui::Color32::from_rgb(180, 180, 180)
+                            theme::FG_MUTED
                         } else if entry.scanning {
-                            egui::Color32::YELLOW
+                            theme::ACCENT_SCAN
                         } else if entry.is_dir {
-                            egui::Color32::from_rgb(100, 150, 255)
+                            theme::ACCENT_DIR
                         } else {
-                            egui::Color32::from_rgb(200, 200, 200)
+                            theme::ACCENT_FILE
                         };
 
                         let bg = if is_selected {
-                            Some(egui::Color32::from_rgb(0, 80, 120))
+                            Some(theme::BG_SELECTION)
                         } else {
                             None
                         };
@@ -502,16 +517,18 @@ impl GuiApp {
                                     egui::vec2(avail.x, (avail.y - 4.0).max(6.0)),
                                     egui::Sense::hover(),
                                 );
-                                ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(40));
+                                ui.painter().rect_filled(rect, 2.0, theme::BG_BAR);
                                 let fill_w = (rect.width() * pct as f32).max(0.0);
                                 if fill_w > 0.5 {
                                     let fill_rect = egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, rect.height()));
+                                    // Same hue family as the row's text colour:
+                                    // dir-blue, scan-amber, file-neutral.
                                     let bar_color = if entry.scanning {
-                                        egui::Color32::from_rgb(200, 200, 0)
+                                        theme::ACCENT_SCAN
                                     } else if entry.is_dir {
-                                        egui::Color32::from_rgb(0, 150, 200)
+                                        theme::ACCENT_DIR
                                     } else {
-                                        egui::Color32::from_rgb(100, 200, 100)
+                                        theme::ACCENT_FILE
                                     };
                                     ui.painter().rect_filled(fill_rect, 2.0, bar_color);
                                 }
@@ -632,9 +649,9 @@ impl GuiApp {
                             ui.label(egui::RichText::new(format_size(ext.total_size)).monospace());
                             let pct = ext.total_size as f32 / max_ext_size as f32;
                             let (rect, _) = ui.allocate_exact_size(egui::vec2(150.0, 12.0), egui::Sense::hover());
-                            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_gray(40));
+                            ui.painter().rect_filled(rect, 2.0, theme::BG_BAR);
                             let fill = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * pct, rect.height()));
-                            ui.painter().rect_filled(fill, 2.0, egui::Color32::from_rgb(0, 150, 200));
+                            ui.painter().rect_filled(fill, 2.0, theme::ACCENT_HEADING);
                             ui.end_row();
                         }
                     });
@@ -656,7 +673,7 @@ impl GuiApp {
                     .show(ctx, |ui| {
                         ui.label(format!("Delete {kind}: {name}"));
                         ui.label(format!("Size: {}", format_size(size)));
-                        ui.colored_label(egui::Color32::RED, "This action cannot be undone!");
+                        ui.colored_label(theme::WARN, "This action cannot be undone!");
                         ui.horizontal(|ui| {
                             if ui.button("Yes, delete (y)").clicked() {
                                 if let GuiDialog::ConfirmDelete { path, is_dir, .. } = &self.dialog {
@@ -678,7 +695,7 @@ impl GuiApp {
                     .collapsible(false).resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                     .show(ctx, |ui| {
-                        ui.colored_label(egui::Color32::RED, &message);
+                        ui.colored_label(theme::WARN, &message);
                         if ui.button("OK").clicked() { close_dialog = true; }
                     });
             }

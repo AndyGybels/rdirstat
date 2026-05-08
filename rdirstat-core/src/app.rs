@@ -6,7 +6,7 @@ use std::{fs, thread};
 use crate::logging::log;
 use crate::model::DirEntry;
 use crate::scan::{start_scan, ScanState};
-use crate::util::strip_unc_prefix;
+use crate::util::{allocated_size, strip_unc_prefix};
 
 pub struct AppState {
     pub current_dir: PathBuf,
@@ -126,7 +126,7 @@ impl AppState {
             let file_size = if is_dir {
                 0
             } else {
-                entry.metadata().map(|m| m.len()).unwrap_or(0)
+                entry.metadata().map(|m| allocated_size(&m)).unwrap_or(0)
             };
 
             self.entries.push(DirEntry {

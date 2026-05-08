@@ -16,3 +16,13 @@ section = "utils"
 assets = [
     ["target/release/rdirstat-gui", "usr/bin/", "755"],
 ]
+
+[package.metadata.generate-rpm]
+summary = "A fast disk space analyzer (GUI)"
+# `auto-req = "auto"` extracts NEEDED entries from the ELF binary so the RPM's
+# Requires: list reflects actual library dependencies (libGL, libxcb,
+# libwayland, libxkbcommon, libfontconfig, …) without us hand-curating.
+assets = [
+    { source = "target/release/rdirstat-gui", dest = "/usr/bin/rdirstat-gui", mode = "755" },
+]
+auto-req = "auto"

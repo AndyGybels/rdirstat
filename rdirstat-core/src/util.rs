@@ -1,4 +1,27 @@
+use std::fs::Metadata;
 use std::path::PathBuf;
+
+/// Size on disk for a file — what the filesystem actually allocated.
+///
+/// On Unix, this is `st_blocks * 512`, matching `du` (default), `stat -f %z`,
+/// and what tools like KDirStat / QDirStat / WinDirStat show. It correctly
+/// reflects sparse files (smaller than logical), filesystems with cluster
+/// rounding (larger than logical), and APFS clones.
+///
+/// On other platforms we currently fall back to the logical file length
+/// (`Metadata::len()`). On Windows the accurate value would come from
+/// `GetCompressedFileSizeW`, which can be added later if needed.
+pub fn allocated_size(metadata: &Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return metadata.blocks().saturating_mul(512);
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.len()
+    }
+}
 
 pub fn strip_unc_prefix(path: PathBuf) -> PathBuf {
     let s = path.to_string_lossy();

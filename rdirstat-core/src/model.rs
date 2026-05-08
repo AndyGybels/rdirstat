@@ -11,7 +11,13 @@ pub struct DirEntry {
 
 impl DirEntry {
     pub fn current_size(&self, scan: &ScanState) -> u64 {
-        if self.is_dir {
+        // The ".." parent-nav entry has `path = <parent>`, so a naive size
+        // lookup returns the entire parent directory's size and double-counts
+        // it in any sum across `entries`. It's a navigation affordance, not
+        // a member of the current directory — report 0.
+        if self.is_parent {
+            0
+        } else if self.is_dir {
             scan.get_size(&self.path).unwrap_or(0)
         } else {
             self.file_size

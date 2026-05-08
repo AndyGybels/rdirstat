@@ -7,7 +7,7 @@ use std::{fs, thread};
 use ignore::WalkBuilder;
 
 use crate::logging::log;
-use crate::util::strip_unc_prefix;
+use crate::util::{allocated_size, strip_unc_prefix};
 
 /// A tracked large file or directory.
 #[derive(Clone)]
@@ -61,10 +61,19 @@ pub struct ScanState {
     /// Per-directory completion: entries yielded by walker, entries expected.
     /// (yielded_count, expected_count or 0 if unknown)
     dir_completion: Mutex<HashMap<PathBuf, (usize, usize)>>,
+    /// (dev, ino) of every counted file, sharded by ino to spread lock contention.
+    /// Used to dedup hardlinks and macOS firmlink double-traversal
+    /// (e.g. /Users vs /System/Volumes/Data/Users).
+    #[cfg(unix)]
+    seen_inodes: [Mutex<HashSet<(u64, u64)>>; INODE_SHARDS],
+    /// Files skipped as inode-aliases (hardlinks / firmlinks).
+    pub aliased_files: AtomicU64,
 }
 
 const TOP_N: usize = 10;
 const FLUSH_INTERVAL: u64 = 5000;
+#[cfg(unix)]
+const INODE_SHARDS: usize = 64;
 
 impl ScanState {
     pub fn new() -> Arc<Self> {
@@ -86,7 +95,25 @@ impl ScanState {
             deepest_path: Mutex::new((PathBuf::new(), 0)),
             scan_start: Mutex::new(None),
             dir_completion: Mutex::new(HashMap::with_capacity(100_000)),
+            #[cfg(unix)]
+            seen_inodes: std::array::from_fn(|_| Mutex::new(HashSet::with_capacity(16_384))),
+            aliased_files: AtomicU64::new(0),
         })
+    }
+
+    /// Returns true if this (dev, ino) is new (count it); false if already seen.
+    /// Always returns true on non-Unix.
+    #[inline]
+    fn record_inode(&self, _dev: u64, _ino: u64) -> bool {
+        #[cfg(unix)]
+        {
+            let shard = (_ino as usize) & (INODE_SHARDS - 1);
+            self.seen_inodes[shard].lock().unwrap().insert((_dev, _ino))
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
     }
 
     pub fn get_size(&self, path: &Path) -> Option<u64> {
@@ -212,16 +239,33 @@ impl ScanState {
         *self.deepest_path.lock().unwrap() = (PathBuf::new(), 0);
         *self.scan_start.lock().unwrap() = None;
         self.dir_completion.lock().unwrap().clear();
+        #[cfg(unix)]
+        for shard in &self.seen_inodes {
+            shard.lock().unwrap().clear();
+        }
+        self.aliased_files.store(0, Ordering::Relaxed);
     }
 
-    /// Apply batched "entry yielded" counts and check for completions.
-    /// A directory completes when yielded == expected and all child dirs are complete.
+    /// Apply batched expected/yielded updates and detect newly-complete dirs.
+    ///
+    /// A directory `D` is **complete** when every immediate file/symlink child
+    /// has been emitted by the walker AND every immediate subdirectory child
+    /// has itself recursively completed. Concretely, `yielded[D] == expected[D]`
+    /// where:
+    ///   - `expected[D]` is the total number of entries in D, set when the
+    ///      walker first yields D (via `read_dir(D).count()`).
+    ///   - `yielded[D]` is incremented by 1 per immediate file/symlink child
+    ///      yielded, and by 1 per immediate subdir child completing (cascade).
+    ///
+    /// `usize::MAX` is the "expected not yet known" sentinel — distinguishes
+    /// a legitimately empty dir (`expected == 0`) from one we haven't visited.
     fn process_completions(
         &self,
         yielded: &mut HashMap<PathBuf, usize>,
+        pending_expected: &mut Vec<(PathBuf, usize)>,
         root: &Path,
     ) -> Vec<PathBuf> {
-        if yielded.is_empty() {
+        if yielded.is_empty() && pending_expected.is_empty() {
             return Vec::new();
         }
 
@@ -229,26 +273,40 @@ impl ScanState {
         let mut completion = self.dir_completion.lock().unwrap();
         let mut to_check: Vec<PathBuf> = Vec::new();
 
-        // Apply yielded counts
+        // Register newly-known expected counts. Empty dirs (expected = 0) are
+        // included so they auto-complete on the very next check below.
+        for (path, expected) in pending_expected.drain(..) {
+            let entry = completion
+                .entry(path.clone())
+                .or_insert((0, usize::MAX));
+            entry.1 = expected;
+            to_check.push(path);
+        }
+
+        // Apply yielded counts.
         for (parent, count) in yielded.drain() {
-            let entry = completion.entry(parent.clone()).or_insert((0, 0));
+            let entry = completion
+                .entry(parent.clone())
+                .or_insert((0, usize::MAX));
             entry.0 += count;
             to_check.push(parent);
         }
 
-        // Check completions and cascade
+        // Cascade-aware completion check. Walks up the tree as parents become
+        // satisfied by their last child completing.
         while let Some(path) = to_check.pop() {
-            if let Some(&(yielded, expected)) = completion.get(&path) {
-                if expected > 0 && yielded >= expected {
+            if let Some(&(yielded_n, expected_n)) = completion.get(&path) {
+                if expected_n != usize::MAX && yielded_n >= expected_n {
                     completion.remove(&path);
                     newly_completed.push(path.clone());
 
-                    // Cascade to parent
+                    // Bubble completion to parent: this subdir is now "done"
+                    // from parent's perspective.
                     if path != root {
                         if let Some(parent) = path.parent() {
                             let parent_entry = completion
                                 .entry(parent.to_path_buf())
-                                .or_insert((0, 0));
+                                .or_insert((0, usize::MAX));
                             parent_entry.0 += 1;
                             to_check.push(parent.to_path_buf());
                         }
@@ -269,8 +327,11 @@ struct ThreadLocalState {
     local_dir_sizes: HashMap<PathBuf, u64>,
     local_ext_stats: HashMap<String, (u64, u64)>,
     /// Entries yielded per parent directory (for completion tracking).
+    /// Only file/symlink children contribute here; subdirs propagate via
+    /// cascade when they themselves complete.
     local_yielded: HashMap<PathBuf, usize>,
-    /// Directories to register with their expected child counts (depth <= 1 only).
+    /// (dir, expected_child_count) pairs gathered this batch; flushed and
+    /// turned into completion-map entries on the next flush.
     pending_expected: Vec<(PathBuf, usize)>,
     local_count: u64,
     local_deepest: (PathBuf, usize),
@@ -303,17 +364,13 @@ impl ThreadLocalState {
     }
 
     fn flush_completions(&mut self) {
-        // Register any pending expected counts
-        if !self.pending_expected.is_empty() {
-            let mut completion = self.state.dir_completion.lock().unwrap();
-            for (path, expected) in self.pending_expected.drain(..) {
-                let entry = completion.entry(path).or_insert((0, 0));
-                entry.1 = expected;
-            }
-        }
-
+        // process_completions now atomically applies expected + yielded under
+        // a single dir_completion lock and walks the cascade. Empty dirs and
+        // newly-registered expected paths are queued for the completion check
+        // on this same call.
         let newly_completed = self.state.process_completions(
             &mut self.local_yielded,
+            &mut self.pending_expected,
             &self.root,
         );
 
@@ -321,7 +378,12 @@ impl ThreadLocalState {
             return;
         }
 
-        // Get sizes and mark completed
+        // Snapshot final sizes for newly-complete dirs. This is correct because
+        // `flush_dir_sizes` ran before us in `flush()`, and any size for a
+        // recursively-completed subtree must already have been flushed by its
+        // contributing thread (each thread flushes sizes before yielded, and
+        // a dir cannot complete until every contributing thread has flushed
+        // its yielded count).
         let completed_with_sizes: Vec<(PathBuf, u64)> = {
             let sizes = self.state.dir_sizes.lock().unwrap();
             newly_completed
@@ -354,8 +416,12 @@ impl ThreadLocalState {
         let is_dir = ft.map_or(false, |ft| ft.is_dir());
         let is_file = ft.map_or(false, |ft| ft.is_file());
 
-        // Every entry (file, dir, symlink) counts as yielded in its parent
-        if depth > 0 {
+        // Files and symlinks count as yielded in their parent the moment they
+        // appear. Subdirectories do NOT count here; they only contribute when
+        // they themselves complete (via the cascade in process_completions).
+        // This is what makes "complete" mean "subtree fully processed" rather
+        // than "immediate children listed".
+        if depth > 0 && !is_dir {
             if let Some(parent) = path.parent() {
                 *self.local_yielded
                     .entry(parent.to_path_buf())
@@ -369,16 +435,35 @@ impl ThreadLocalState {
                 self.local_deepest = (path.clone(), depth);
             }
 
-            // For shallow dirs, count children cheaply (few dirs at depth 0-1).
-            // For deeper dirs, expected count comes from the walker yielding entries.
-            if depth <= 1 {
-                let expected = fs::read_dir(&path)
-                    .map(|rd| rd.count())
-                    .unwrap_or(0);
-                self.pending_expected.push((path, expected));
-            }
+            // Establish `expected[D]` for every directory we encounter. The
+            // count comes from a second `read_dir` on D, which is virtually
+            // free here: the kernel just listed D for the walker, so D's
+            // entries are hot in the dentry/inode cache. On error (e.g.
+            // permission denied) we record 0, which lets the dir auto-complete
+            // immediately rather than hanging forever.
+            let expected = fs::read_dir(&path)
+                .map(|rd| rd.count())
+                .unwrap_or(0);
+            self.pending_expected.push((path, expected));
         } else if is_file {
-            let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            // Stat the file once. Use the result for both dedup and size.
+            let metadata = entry.metadata().ok();
+
+            // Inode dedup: handles hardlinks AND macOS firmlink double-traversal
+            // (e.g. /Users and /System/Volumes/Data/Users alias the same inodes).
+            // On non-Unix this is a no-op.
+            #[cfg(unix)]
+            if let Some(ref m) = metadata {
+                use std::os::unix::fs::MetadataExt;
+                if !self.state.record_inode(m.dev(), m.ino()) {
+                    self.state
+                        .aliased_files
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+
+            let len = metadata.as_ref().map(allocated_size).unwrap_or(0);
 
             self.state.total_bytes.fetch_add(len, Ordering::Relaxed);
             self.state.record_top_file(&path, len);

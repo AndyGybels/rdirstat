@@ -2984,6 +2984,7 @@ dependencies = [
  "chrono",
  "ignore",
  "num_cpus",
+ "tempfile",
 ]
 
 [[package]]

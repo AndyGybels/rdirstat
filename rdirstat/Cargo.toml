@@ -16,3 +16,10 @@ section = "utils"
 assets = [
     ["target/release/rdirstat", "usr/bin/", "755"],
 ]
+
+[package.metadata.generate-rpm]
+summary = "A fast disk space analyzer (TUI)"
+assets = [
+    { source = "target/release/rdirstat", dest = "/usr/bin/rdirstat", mode = "755" },
+]
+auto-req = "auto"

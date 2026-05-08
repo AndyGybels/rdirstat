@@ -69,7 +69,14 @@ pub fn build_snapshot(
         entries
             .iter()
             .map(|(name, path, is_dir, is_parent, file_size)| {
-                let size = if *is_dir {
+                // The ".." parent-nav entry is a navigation affordance, not a
+                // member of the current directory. Reporting `dir_sizes[parent]`
+                // here would (a) display the entire parent's size next to ".."
+                // and (b) inflate `total_entry_size` by exactly that amount,
+                // making the header read "current dir + parent dir".
+                let size = if *is_parent {
+                    0
+                } else if *is_dir {
                     dir_sizes.get(path).copied().unwrap_or(0)
                 } else {
                     *file_size
