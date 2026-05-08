@@ -25,17 +25,11 @@ forever on large trees or had visible UI lag while scanning. rdirstat walks
 the filesystem in parallel via the `ignore` crate, keeps a live shared state,
 and snapshots it at 100 ms intervals so the UI stays responsive even mid-scan.
 
-Along the way it picked up a handful of correctness wins worth mentioning:
+I also wanted both a TUI (for SSH sessions and dotfile-machines) and a native
+desktop GUI, without maintaining two scanners. rdirstat ships
+both — they share the exact same engine and snapshot pipeline; only the
+rendering layer differs.
 
-- **Allocated size, not logical size** — `m.blocks() * 512` on Unix, matching
-  `du`. Sparse files report their real on-disk footprint; tiny files account
-  for cluster rounding.
-- **Inode deduplication** — hardlinks and macOS firmlinks (where `/Users` and
-  `/System/Volumes/Data/Users` are the same files at two paths) contribute
-  exactly once instead of inflating the total.
-- **Honest "complete" status** — a directory is only marked done when its
-  whole subtree has finished, not the moment its immediate children have been
-  listed.
 
 ## Install
 
